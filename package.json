@@ -1,0 +1,19 @@
+{
+  "name": "marrow",
+  "version": "0.1.0",
+  "description": "AI companion runtime — body-state centric, event-sourced, development-capable",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch",
+    "run:phase1": "tsc && node dist/index.js"
+  },
+  "keywords": ["ai-companion", "state-machine", "event-sourcing"],
+  "author": "web-magi",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}

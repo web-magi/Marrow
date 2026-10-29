@@ -41,3 +41,6 @@ coverage/
 # Cache
 .cache/
 .tmp/
+
+# Runtime data (event log, generated at runtime)
+data/

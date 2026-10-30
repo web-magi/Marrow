@@ -27,6 +27,19 @@ const MONITOR_PORT = 8787;
 /** 状态历史缓冲区大小（用于绘制曲线） */
 const HISTORY_SIZE = 500;
 
+/**
+ * 时间缩放因子
+ *
+ * 通过环境变量 TIME_SCALE 控制。
+ * - TIME_SCALE=1（默认）：真实时间，每 tick 推进 10 秒
+ * - TIME_SCALE=60：每 tick 推进 600 秒（10 分钟），相当于快进 60 倍
+ * - TIME_SCALE=360：每 tick 推进 1 小时，几小时的变化在几分钟内可见
+ *
+ * 原理：只放大 deltaSeconds，不改变状态机的物理常量。
+ * 因此测试结果与真实运行一致，只是时间被压缩。
+ */
+const TIME_SCALE = Math.max(1, parseInt(process.env.TIME_SCALE ?? '1', 10));
+
 /** 当前状态（全局，供 HTTP 接口读取） */
 let currentState: MarrowState | null = null;
 
@@ -139,7 +152,7 @@ const MONITOR_HTML = `<!DOCTYPE html>
 </head>
 <body>
   <h1>Marrow — 实时监控 <span class="live-dot"></span></h1>
-  <p class="subtitle">阶段一：最小状态机 · 每 10 秒 tick · 数据每秒刷新</p>
+  <p class="subtitle">阶段一：最小状态机 · 数据每秒刷新 · <span id="timeScale"></span></p>
 
   <div class="status-bar">
     <div class="status-card">
@@ -224,6 +237,7 @@ const MONITOR_HTML = `<!DOCTYPE html>
         document.getElementById('behavior').textContent = (BEHAVIOR_LABELS[s.lastBehavior.kind] || s.lastBehavior.kind) + ' · ' + s.lastBehavior.reason;
         document.getElementById('uptime').textContent = Math.floor(s.uptimeSeconds) + 's';
         document.getElementById('interruptions').textContent = s.interruptionCount;
+        document.getElementById('timeScale').textContent = '时间加速 ' + data.timeScale + 'x';
 
         // 更新曲线
         chart.data.labels = hist.map(h => {
@@ -274,6 +288,7 @@ function startMonitorServer(): void {
       const response = {
         current: currentState,
         history: stateHistory,
+        timeScale: TIME_SCALE,
       };
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(response));
@@ -302,6 +317,11 @@ function startMonitorServer(): void {
 async function main(): Promise<void> {
   console.log('=== Marrow Phase 1: Minimal State Machine ===');
   console.log(`Tick interval: ${TICK_INTERVAL_MS}ms`);
+  console.log(`Time scale: ${TIME_SCALE}x (each tick simulates ${(TICK_INTERVAL_MS / 1000 * TIME_SCALE).toFixed(0)}s)`);
+  if (TIME_SCALE > 1) {
+    const realMinutes = (24 / TIME_SCALE) * 60;
+    console.log(`  -> 24h of simulation will take ~${realMinutes.toFixed(1)} minutes of real time`);
+  }
   console.log('Press Ctrl+C to stop.\n');
 
   // 加载已有事件并重放
@@ -330,8 +350,11 @@ async function main(): Promise<void> {
 
   const interval = setInterval(() => {
     const now = Date.now();
-    const deltaSeconds = (now - lastTickTime) / 1000;
+    const realDelta = (now - lastTickTime) / 1000;
     lastTickTime = now;
+
+    // 应用时间缩放因子：真实时间 × 缩放 = 模拟时间
+    const deltaSeconds = realDelta * TIME_SCALE;
 
     const tickEvent = createTickEvent(deltaSeconds);
     appendEvent(tickEvent);

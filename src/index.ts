@@ -15,7 +15,7 @@
 import { createServer } from 'node:http';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { createInitialState, applyEvent, type MarrowState } from './state.js';
+import { createInitialState, applyEvent, evokeMemoryFromText, type MarrowState } from './state.js';
 import {
   type TickEvent,
   type EnvironmentEvent,
@@ -29,9 +29,21 @@ import {
   type SimulatedMotionSensor,
   type SimulatedBatterySensor,
 } from './sensors.js';
-import { createLLMClient, buildStateSnapshot, type LLMClient } from './llm.js';
+import {
+  createLLMClient,
+  buildStateSnapshot,
+  EXTRACTOR_VERSION,
+  type LLMClient,
+  type ExtractionResult,
+} from './llm.js';
+import { appraise, type AppraisalContext } from './appraisal.js';
 import { filterCandidateBehavior } from './dialogue.js';
-import type { DialogueEvent, SleepEvent } from './events.js';
+import type {
+  DialogueEvent,
+  SleepEvent,
+  ObservationEvent,
+  AppraisalEvent,
+} from './events.js';
 
 /**
  * 轻量 .env 加载器
@@ -142,16 +154,20 @@ function createTickEvent(deltaSeconds: number): TickEvent {
 }
 
 /**
- * 处理对话请求（阶段四）
+ * 处理对话请求（阶段四收尾：观察—评价—对话三段式事件链）
  *
- * 流程（主客观分离）：
- * 1. LLM 从用户输入提取客观事实（action、intensity）+ 生成回复文本
- * 2. 写入用户输入事件（携带 action/intensity）
- * 3. applyEvent 调用 appraisal 计算主观情绪（moodDelta），不依赖 LLM
- * 4. 状态机过滤候选行为（interruption_flag 强制拦截）
- * 5. 写入伴侣输出事件
+ * 流程（主客观分离，全链路事件溯源）：
+ * 1. LLM 提取：客观事实（action/intensity/confidence/facts/uncertainty）+ 渲染回复文本
+ * 2. 写 ObservationEvent（纯观察记录，不驱动状态变化）
+ * 3. appraise：基于动态状态 + 观察置信度计算多维情绪增量
+ * 4. 写 AppraisalEvent（主观评价证据链，arousalDelta 由此应用）
+ * 5. 写 DialogueEvent（携带 observationId/appraisalId 溯源，
+ *    moodDelta = AppraisalResult.valenceDelta，mood 变化由此应用）
+ * 6. 状态机过滤候选行为（interruption_flag 强制拦截）→ 写伴侣输出事件
  *
- * 关键：LLM 不决定情绪效价，状态机（appraisal）决定。
+ * 关键：LLM 不决定情绪效价，状态机（appraisal）决定；
+ * 回放时 applyDialogue 对新格式事件直接采用 payload.moodDelta，
+ * 保证实跑与回放完全一致。
  */
 async function handleChatRequest(
   req: import('node:http').IncomingMessage,
@@ -188,18 +204,94 @@ async function handleChatRequest(
   const state = currentState;
   const timestamp = new Date().toISOString();
 
-  // 1. 调用 LLM：提取客观事实（action、intensity）+ 生成回复文本
+  // 1. 调用 LLM：提取客观事实 + 生成回复文本
   //    LLM 只做意图提取和文本渲染，不计算情绪效价
   const snapshot = buildStateSnapshot(state);
-  let candidate: { text: string; action: import('./events.js').DialogueAction; intensity: number };
+  const fallbackExtraction: ExtractionResult = {
+    action: 'unknown',
+    intensity: 0.3,
+    confidence: 0.2,
+    facts: [],
+    uncertainty: 0.8,
+  };
+  let candidate: {
+    text: string;
+    action: import('./events.js').DialogueAction;
+    intensity: number;
+    extraction: ExtractionResult;
+  };
   try {
     candidate = await llmClient.generateResponse(snapshot, userInput);
   } catch (err) {
     console.error('[LLM] generateResponse failed:', err);
-    candidate = { text: '...（暂时无法回应）', action: 'unknown', intensity: 0.3 };
+    candidate = {
+      text: '...（暂时无法回应）',
+      action: 'unknown',
+      intensity: 0.3,
+      extraction: fallbackExtraction,
+    };
   }
 
-  // 2. 写入用户输入事件（携带客观 action/intensity，moodDelta 由 appraisal 计算）
+  // 2. 写观察事件（纯事实记录，不驱动状态变化）
+  const observationEvent: ObservationEvent = {
+    type: 'observation',
+    id: generateEventId(),
+    timestamp,
+    payload: {
+      source: 'user_text',
+      content: userInput,
+      action: candidate.extraction.action,
+      intensity: candidate.extraction.intensity,
+      confidence: candidate.extraction.confidence,
+      uncertainty: candidate.extraction.uncertainty,
+      facts: candidate.extraction.facts,
+      extractorVersion: EXTRACTOR_VERSION,
+    },
+  };
+  appendEvent(observationEvent);
+  const stateAfterObservation = applyEvent(state, observationEvent);
+
+  // 3. appraise：基于动态状态 + 观察置信度计算多维情绪增量
+  //    记忆唤醒证据链与 applyDialogue 内部逻辑保持一致的确定性检索
+  const evoked = evokeMemoryFromText(stateAfterObservation.episodicBuffer, userInput);
+  const appraisalContext: AppraisalContext = {
+    associationWeight: stateAfterObservation.associationWeight,
+    trust: stateAfterObservation.trust,
+    defensiveness: stateAfterObservation.defensiveness,
+    moodBaseline: stateAfterObservation.moodBaseline,
+    needValidation: stateAfterObservation.needValidation,
+    needNovelty: stateAfterObservation.needNovelty,
+    needSecurity: stateAfterObservation.needSecurity,
+    traits: stateAfterObservation.traits,
+    confidence: candidate.extraction.confidence,
+    evidenceAssociationIds: evoked ? [evoked.id] : [],
+  };
+  const appraisalResult = appraise(
+    candidate.extraction.action,
+    candidate.extraction.intensity,
+    appraisalContext,
+  );
+
+  // 4. 写评价事件（主观感受证据链；arousalDelta 由 applyAppraisal 应用）
+  const appraisalEvent: AppraisalEvent = {
+    type: 'appraisal',
+    id: generateEventId(),
+    timestamp: new Date().toISOString(),
+    payload: {
+      sourceObservationId: observationEvent.id,
+      valenceDelta: appraisalResult.valenceDelta,
+      arousalDelta: appraisalResult.arousalDelta,
+      energyDelta: appraisalResult.energyDelta,
+      confidence: appraisalResult.confidence,
+      evidenceAssociationIds: appraisalResult.evidenceAssociationIds,
+    },
+  };
+  appendEvent(appraisalEvent);
+  const stateAfterAppraisal = applyEvent(stateAfterObservation, appraisalEvent);
+
+  // 5. 写用户输入事件（携带观察/评价溯源 ID）
+  //    moodDelta = AppraisalResult.valenceDelta：回放时 applyDialogue 对新格式
+  //    事件直接采用该值，保证实跑与回放一致；旧格式事件仍由 appraisal 重算
   const userEvent: DialogueEvent = {
     type: 'dialogue',
     id: generateEventId(),
@@ -207,21 +299,23 @@ async function handleChatRequest(
     payload: {
       direction: 'user_input',
       text: userInput,
-      action: candidate.action,
-      intensity: candidate.intensity,
-      moodDelta: 0, // 由 applyEvent 中的 appraisal 覆盖计算
+      action: candidate.extraction.action,
+      intensity: candidate.extraction.intensity,
+      moodDelta: appraisalResult.valenceDelta,
       salience: 0.3,
       wordCount: userInput.length,
+      observationId: observationEvent.id,
+      appraisalId: appraisalEvent.id,
     },
   };
   appendEvent(userEvent);
-  // applyDialogue 内部调用 appraisal，基于 action/intensity 计算 moodDelta 并更新 mood/energy/trust
-  const stateAfterUser = applyEvent(state, userEvent);
+  // applyDialogue 应用 mood/energy/trust/需求变化（新格式直接采用 payload.moodDelta）
+  const stateAfterUser = applyEvent(stateAfterAppraisal, userEvent);
 
-  // 3. 状态机过滤候选行为（interruption_flag 强制拦截）
+  // 6. 状态机过滤候选行为（interruption_flag 强制拦截）
   const filterResult = filterCandidateBehavior(stateAfterUser, candidate);
 
-  // 4. 写入伴侣输出事件（携带候选文本与过滤结果）
+  // 7. 写入伴侣输出事件（携带候选文本与过滤结果）
   //    伴侣输出不改变自己的 mood（moodDelta=0），只消耗少量 energy
   const companionEvent: DialogueEvent = {
     type: 'dialogue',

@@ -22,6 +22,8 @@ import type {
   MemoryEvocationEvent,
   SleepEvent,
   TraitShiftEvent,
+  ObservationEvent,
+  AppraisalEvent,
   PersonalityTraits,
   AssociationMemory,
   EpisodicMemory,
@@ -361,11 +363,30 @@ function decayAssociations(
 }
 
 /**
- * 生成一个 [-1, 1] 区间的随机游走步长
- * 使用简单均匀分布，累积效果近似布朗运动。
+ * FNV-1a 32 位哈希（确定性伪随机源）
+ *
+ * 将任意字符串（事件 ID + 用途标签）映射为无符号 32 位整数。
+ * 事件溯源要求回放确定性：tick 中的背景噪声不能用 Math.random()，
+ * 而由事件 ID 派生出确定性的伪随机步长——同一事件回放结果完全一致。
  */
-function walkStep(step: number): number {
-  return (Math.random() * 2 - 1) * step;
+export function hashString(s: string): number {
+  let hash = 0x811c9dc5; // FNV offset basis
+  for (let i = 0; i < s.length; i++) {
+    hash ^= s.charCodeAt(i);
+    // FNV prime 16777619，用位移避免 64 位浮点精度损失
+    hash = (hash * 0x01000193) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+/**
+ * 生成一个 [-1, 1] 区间的确定性"随机"游走步长
+ *
+ * 步长由 seed（通常是 `${event.id}:mood` 等）哈希决定，
+ * 对同一事件 ID 永远产生相同结果，保证回放确定性。
+ */
+function walkStep(step: number, seed: string): number {
+  return ((hashString(seed) / 0xffffffff) * 2 - 1) * step;
 }
 
 /**
@@ -376,8 +397,10 @@ function walkStep(step: number): number {
  *
  * 记忆唤醒是潜意识的：一旦触发，直接影响 mood 和 energy，
  * 不受当前体力/注意力限制（回忆可以让人精神一振，也可以让人瞬间低落）。
+ *
+ * 导出供 index.ts 在写 AppraisalEvent 前收集证据链（evidenceAssociationIds）。
  */
-function evokeMemoryFromText(
+export function evokeMemoryFromText(
   buffer: EpisodicMemory[],
   text: string,
 ): EpisodicMemory | null {
@@ -452,16 +475,17 @@ function applyTick(state: MarrowState, event: TickEvent): MarrowState {
     c.ENERGY_MAX,
   );
 
-  // === mood_baseline：随机游走 + energy 下拉 + 伤痕下拉 ===
-  const moodNoise = walkStep(c.MOOD_WALK_STEP) * delta;
+  // === mood_baseline：确定性随机游走 + energy 下拉 + 伤痕下拉 ===
+  // 噪声种子由事件 ID 派生，保证回放时同一 tick 产生完全一致的游走
+  const moodNoise = walkStep(c.MOOD_WALK_STEP, `${event.id}:mood`) * delta;
   const energyDeficit = Math.max(0, c.ENERGY_CRITICAL_FOR_MOOD - newEnergy);
   const energyMoodPull = -energyDeficit * c.ENERGY_MOOD_PULL_PER_SECOND * delta * 0.1;
   const scarPull = computeScarMoodPull(state.associations) * delta * 0.01;
   let moodBaseline = state.moodBaseline + moodNoise + energyMoodPull + scarPull;
 
-  // === arousal：均值回归到基线 10 + 随机游走 + energy 上限 ===
+  // === arousal：均值回归到基线 10 + 确定性随机游走 + energy 上限 ===
   // 替代纯指数衰减，避免无刺激时唤醒度死寂在 0
-  const arousalNoise = walkStep(c.AROUSAL_WALK_STEP) * delta;
+  const arousalNoise = walkStep(c.AROUSAL_WALK_STEP, `${event.id}:arousal`) * delta;
   const arousalRevert =
     c.AROUSAL_MEAN_REVERSION_RATE * (c.AROUSAL_BASELINE - state.arousal) * delta;
   let newArousal = clamp(
@@ -474,8 +498,9 @@ function applyTick(state: MarrowState, event: TickEvent): MarrowState {
     newArousal = Math.min(newArousal, c.ENERGY_AROUSAL_CAP);
   }
 
-  // === attention_focus：随机游走 + 物理强制（疲惫/崩溃时压到 20% 以下） ===
-  let newAttentionFocus = state.attentionFocus + walkStep(c.ATTENTION_WALK_STEP) * delta;
+  // === attention_focus：确定性随机游走 + 物理强制（疲惫/崩溃时压到 20% 以下） ===
+  let newAttentionFocus =
+    state.attentionFocus + walkStep(c.ATTENTION_WALK_STEP, `${event.id}:attention`) * delta;
   if (newEnergy < 20 || state.moodBaseline < 20) {
     // 极度疲惫或心情崩塌 → 注意力被强制压低（模拟走神）
     newAttentionFocus =
@@ -822,6 +847,12 @@ function applyDialogue(
   const attentionMod = 0.3 + state.attentionFocus * 0.7; // 0.3 ~ 1.0
 
   if (direction === 'user_input' && action && intensity !== undefined) {
+    // === 记忆唤醒：先检索情景记忆缓冲区（在 appraise 之前） ===
+    // 唤醒的记忆 ID 需要传入 AppraisalContext.evidenceAssociationIds，
+    // 供 AppraisalEvent 记录证据链。唤醒效果（mood/energy/内耗）仍在下方应用。
+    const evoked = evokeMemoryFromText(state.episodicBuffer, text);
+    const evidenceAssociationIds = evoked ? [evoked.id] : [];
+
     const context: AppraisalContext = {
       associationWeight: state.associationWeight,
       trust: state.trust,
@@ -831,20 +862,32 @@ function applyDialogue(
       needNovelty: state.needNovelty,
       needSecurity: state.needSecurity,
       traits: state.traits,
+      // 旧格式事件没有观察置信度，默认 1.0（完整信任）
+      confidence: 1.0,
+      evidenceAssociationIds,
     };
     const result = appraise(action, intensity, context);
 
-    // moodDelta 受注意力焦点调制
-    let weightedMoodDelta = result.moodDelta * attentionMod;
+    // 效价来源（主客观分离的关键衔接）：
+    // - 新格式事件（带 observationId）：payload.moodDelta 携带的是写入方
+    //   （index.ts）用真实观察置信度算出的 AppraisalResult.valenceDelta，
+    //   直接采用——保证实跑状态变化与 AppraisalEvent 证据链完全一致；
+    //   result 仍用于 trustDelta / needDeltas（与置信度无关）。
+    // - 旧格式事件（无 observationId）：payload.moodDelta 历史上恒为 0，
+    //   必须用 appraise 重新计算（confidence=1.0，完整信任）。
+    const baseValenceDelta = event.payload.observationId
+      ? moodDelta
+      : result.valenceDelta;
+
+    // 效价增量受注意力焦点调制
+    let weightedMoodDelta = baseValenceDelta * attentionMod;
     // 神经质调制：负面事件的情绪冲击被放大（高神经质）或钝化（低神经质）
     if (weightedMoodDelta < 0) {
       weightedMoodDelta *= state.traits.neuroticism;
     }
 
-    // === 记忆唤醒：检索情景记忆缓冲区 ===
     // 正向回忆 → 强制拉高 mood + 恢复 energy（精神一振，无视低体力）
     // 创伤回忆 → 强制拉低 mood + 增加内耗（反刍）
-    const evoked = evokeMemoryFromText(state.episodicBuffer, text);
     let memoryMoodDelta = 0;
     let memoryEnergyDelta = 0;
     let memoryCognitiveLoadDelta = 0;
@@ -1070,6 +1113,10 @@ export function applyEvent(
       return applySleep(state, event);
     case 'trait_shift':
       return applyTraitShiftEvent(state, event);
+    case 'observation':
+      return applyObservation(state, event);
+    case 'appraisal':
+      return applyAppraisal(state, event);
     default: {
       // 穷尽检查：若新增事件类型未处理，编译期报错
       const _exhaustive: never = event;
@@ -1181,6 +1228,46 @@ export function applyTraitShift(
       ),
       resilience: clamp(t.resilience + (shift.resilience ?? 0), c.TRAIT_MIN, c.TRAIT_MAX),
     },
+  };
+}
+
+/**
+ * 处理 ObservationEvent
+ *
+ * 观察是"纯事实记录"，不直接驱动状态变化——
+ * 状态演化由后续的 AppraisalEvent / DialogueEvent 承担。
+ * 这里只更新 lastUpdated 时间戳，保持回放时间轴完整。
+ */
+function applyObservation(
+  state: MarrowState,
+  event: ObservationEvent,
+): MarrowState {
+  return { ...state, lastUpdated: event.timestamp };
+}
+
+/**
+ * 处理 AppraisalEvent
+ *
+ * 评价事件是"主观感受的证据链记录"：
+ * - valenceDelta 不重复应用（mood 变化由 DialogueEvent 应用，
+ *   DialogueEvent.moodDelta = AppraisalResult.valenceDelta）
+ * - arousalDelta 直接应用到 arousal（clamp 到 [0,100]）
+ * - confidence / evidenceAssociationIds 仅作审计记录
+ */
+function applyAppraisal(
+  state: MarrowState,
+  event: AppraisalEvent,
+): MarrowState {
+  const c = STATE_CONSTANTS;
+  const newArousal = clamp(
+    state.arousal + event.payload.arousalDelta,
+    c.AROUSAL_MIN,
+    c.AROUSAL_MAX,
+  );
+  return {
+    ...state,
+    arousal: newArousal,
+    lastUpdated: event.timestamp,
   };
 }
 

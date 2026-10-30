@@ -18,7 +18,9 @@ export type EventType =
   | 'dialogue'
   | 'memory_evocation'
   | 'sleep'
-  | 'trait_shift';
+  | 'trait_shift'
+  | 'observation'
+  | 'appraisal';
 
 /** 事件基类：所有事件共享的字段 */
 export interface BaseEvent {
@@ -152,6 +154,86 @@ export interface DialogueEvent extends BaseEvent {
     filtered?: boolean;
     /** 过滤原因（filtered 为 true 时有值） */
     filterReason?: string;
+    /**
+     * 关联的观察事件 ID（阶段四收尾：对话流程的输入溯源）
+     * 旧事件可能缺失
+     */
+    observationId?: string;
+    /**
+     * 关联的评价事件 ID（阶段四收尾：评价与对话的溯源链）
+     * 旧事件可能缺失
+     */
+    appraisalId?: string;
+  };
+}
+
+/**
+ * ObservationEvent —— 观察事件（阶段四收尾）
+ *
+ * LLM 对用户输入的"纯观察"结果：
+ * - 只提取客观事实：行为类型、强度、事实主张、不确定性
+ * - 不包含任何主观情绪判断（moodDelta/valence 等）——那是 appraisal 的职责
+ *
+ * 观察不直接驱动状态变化，只作为 appraisal 的输入与审计溯源记录。
+ * 事件回放时，观察仅更新时间戳，状态演化由 AppraisalEvent/DialogueEvent 承担。
+ */
+export interface ObservationEvent extends BaseEvent {
+  type: 'observation';
+  payload: {
+    /** 观察来源（目前仅支持用户文本） */
+    source: 'user_text';
+    /** 被观察的原始文本内容 */
+    content: string;
+    /** 提取的客观行为类型（可能为 undefined，表示未能识别） */
+    action?: DialogueAction;
+    /** 提取的客观强度 0-1（可能为 undefined） */
+    intensity?: number;
+    /** 观察置信度 0-1（提取器对自身输出的确定性评估） */
+    confidence: number;
+    /** 不确定性 0-1（与 confidence 互补，供下游审计） */
+    uncertainty: number;
+    /**
+     * 提取的事实主张列表（如"用户提到了火锅"）
+     * 每条主张带独立置信度，支持未来基于证据的记忆检索
+     */
+    facts: Array<{
+      claim: string;
+      confidence: number;
+      evidence?: string;
+    }>;
+    /** 提取器版本（便于回放时按版本兼容旧格式） */
+    extractorVersion: string;
+  };
+}
+
+/**
+ * AppraisalEvent —— 评价事件（阶段四收尾）
+ *
+ * appraisal.ts 基于观察与动态状态计算出的多维情绪增量。
+ * 这是"主观评价"的事件溯源记录：
+ * - valenceDelta：对 mood_baseline 的效价影响（由 DialogueEvent 重复应用，本事件仅作证据链）
+ * - arousalDelta：对 arousal 的唤醒影响（本事件直接应用）
+ * - energyDelta：对 energy 的影响（预留，当前 DialogueEvent 已计算能量消耗）
+ *
+ * 与 DialogueEvent 的关系：
+ * - AppraisalEvent 负责"为什么这么感觉"（记录输入观察与计算结果）
+ * - DialogueEvent 负责"实际状态怎么变"（携带 moodDelta = AppraisalResult.valenceDelta）
+ */
+export interface AppraisalEvent extends BaseEvent {
+  type: 'appraisal';
+  payload: {
+    /** 触发本次评价的观察事件 ID（溯源链） */
+    sourceObservationId: string;
+    /** 对 mood_baseline 的效价增量（valence） */
+    valenceDelta: number;
+    /** 对 arousal 的唤醒增量 */
+    arousalDelta: number;
+    /** 对 energy 的能量增量（预留，当前由 DialogueEvent 处理） */
+    energyDelta: number;
+    /** 观察置信度（低置信时衰减已在 appraise 中完成，此处仅记录） */
+    confidence: number;
+    /** 被唤醒记忆的 ID 列表（证据链，供回放分析） */
+    evidenceAssociationIds: string[];
   };
 }
 
@@ -163,7 +245,9 @@ export type MarrowEvent =
   | DialogueEvent
   | MemoryEvocationEvent
   | SleepEvent
-  | TraitShiftEvent;
+  | TraitShiftEvent
+  | ObservationEvent
+  | AppraisalEvent;
 
 /**
  * MemoryEvocationEvent —— 记忆唤醒事件

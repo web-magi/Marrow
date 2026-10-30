@@ -52,7 +52,7 @@ export interface StateSnapshot {
  * LLM 输出的候选行为
  *
  * 主客观分离：LLM 只做意图提取（action、intensity）和文本渲染，
- * 情绪效价（moodDelta）由 appraisal.ts 基于动态状态计算。
+ * 情绪效价（valenceDelta）由 appraisal.ts 基于动态状态计算。
  */
 export interface CandidateBehavior {
   /** 候选回复文本 */
@@ -61,6 +61,102 @@ export interface CandidateBehavior {
   action: DialogueAction;
   /** 客观强度 0-1（由 LLM 评估） */
   intensity: number;
+  /**
+   * 完整提取结果（含置信度/事实主张/不确定性）
+   * 供 index.ts 写入 ObservationEvent，action/intensity 与上方字段保持一致
+   */
+  extraction: ExtractionResult;
+}
+
+/**
+ * 提取器版本号
+ *
+ * 写入 ObservationEvent.extractorVersion，回放时按版本兼容旧格式。
+ * 提取 prompt 或解析规则变化时递增。
+ */
+export const EXTRACTOR_VERSION = 'extractor-1.1';
+
+/**
+ * 提取结果（纯观察，不含任何主观情绪字段）
+ *
+ * 严格约束：只允许 action/intensity/confidence/facts/uncertainty 五个字段。
+ * 绝不包含 moodDelta/valence 等主观效价——那是 appraisal.ts 的职责。
+ */
+export interface ExtractionResult {
+  /** 客观行为类型 */
+  action: DialogueAction;
+  /** 客观强度 0-1 */
+  intensity: number;
+  /** 提取置信度 0-1（提取器对自身输出的确定性评估） */
+  confidence: number;
+  /** 客观事实主张列表（如"用户提到了火锅"），每条带独立置信度 */
+  facts: Array<{ claim: string; confidence: number }>;
+  /** 不确定性 0-1（与 confidence 互补） */
+  uncertainty: number;
+}
+
+/** 解析失败时的兜底提取结果：低置信 + 高不确定性，绝不伪造高置信度 */
+const EXTRACTION_FALLBACK: ExtractionResult = {
+  action: 'unknown',
+  intensity: 0.3,
+  confidence: 0.2,
+  facts: [],
+  uncertainty: 0.8,
+};
+
+/** 将数值 clamp 到 [0, 1]（非数值回退为默认值） */
+function clamp01(value: unknown, fallback: number): number {
+  if (typeof value !== 'number' || Number.isNaN(value)) return fallback;
+  return Math.max(0, Math.min(1, value));
+}
+
+/**
+ * 从 LLM 原始输出中解析提取结果（纯函数，绝不抛异常）
+ *
+ * 严格 schema 校验：
+ * - action 必须在 DialogueAction 枚举内，缺失/非法 → 整体回退到底兜结果
+ *   （没有可靠的行为类型时，置信度一文不值，绝不伪造）
+ * - intensity/confidence/uncertainty clamp 到 [0,1]，缺失时取保守默认值
+ * - facts 过滤掉非法项（非对象、claim 非字符串或为空）
+ * - JSON 解析失败 → 兜底结果
+ */
+export function parseExtraction(raw: string): ExtractionResult {
+  try {
+    // 容错：LLM 可能输出带 markdown 代码块或额外文字的 JSON
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    const jsonStr = jsonMatch ? jsonMatch[0] : raw;
+    const parsed = JSON.parse(jsonStr) as Record<string, unknown>;
+
+    const rawAction = typeof parsed.action === 'string' ? parsed.action : '';
+    if (!VALID_ACTIONS.has(rawAction as DialogueAction)) {
+      // 行为类型是提取的核心：缺失或非法时整体兜底，绝不伪造置信度
+      return { ...EXTRACTION_FALLBACK, facts: [] };
+    }
+    const action = rawAction as DialogueAction;
+
+    const intensity = clamp01(parsed.intensity, 0.3);
+    const confidence = clamp01(parsed.confidence, 0.5);
+    const uncertainty = clamp01(parsed.uncertainty, 1 - confidence);
+
+    const facts: Array<{ claim: string; confidence: number }> = [];
+    if (Array.isArray(parsed.facts)) {
+      for (const item of parsed.facts) {
+        if (item && typeof item === 'object') {
+          const claim = (item as Record<string, unknown>).claim;
+          if (typeof claim === 'string' && claim.length > 0) {
+            facts.push({
+              claim,
+              confidence: clamp01((item as Record<string, unknown>).confidence, 0.5),
+            });
+          }
+        }
+      }
+    }
+
+    return { action, intensity, confidence, facts, uncertainty };
+  } catch {
+    return { ...EXTRACTION_FALLBACK, facts: [] };
+  }
 }
 
 /** LLM 客户端接口 */
@@ -370,12 +466,15 @@ class RealLLMClient implements LLMClient {
       `3. 可以展现矛盾感——比如嘴上说"没事"，语气却透着疲惫；或者明明想靠近，却因为不安而退缩。真实的人就是这样口是心非。\n` +
       `4. 结合你最近的经历与当前状态，生成候选回复。\n\n` +
       `[意图提取任务]\n` +
-      `除了生成回复，你还需要客观判断用户话语的行为类型和强度。\n` +
+      `除了生成回复，你还需要客观观察用户话语，提取行为类型、强度与事实主张。\n` +
       `行为类型只能是以下之一：greeting, farewell, compliment, insult, complaint, teasing, question, statement, confession, command, comfort, apology, unknown\n` +
       `注意：侮辱性话语（骂脏话、贬低对方）是 insult，不是 compliment。\n` +
-      `强度是 0 到 1 之间的数字，侮辱和赞美通常强度较高。\n\n` +
+      `强度是 0 到 1 之间的数字，侮辱和赞美通常强度较高。\n` +
+      `confidence 是你对本次提取的置信度（0-1）；uncertainty 是你对用户意图的不确定性（0-1）。\n` +
+      `facts 是用户话语中的客观事实主张列表（如"用户提到了火锅"），每条带独立 confidence（0-1）。\n` +
+      `绝对不要输出任何情绪效价字段（如 moodDelta、valence）——情绪由系统计算，不由你决定。\n\n` +
       `必须只输出 JSON，格式如下，不要有其他文字：\n` +
-      `{"text": "你的回复", "action": "行为类型", "intensity": 0.5}`;
+      `{"text": "你的回复", "action": "行为类型", "intensity": 0.5, "confidence": 0.8, "facts": [{"claim": "客观事实", "confidence": 0.9}], "uncertainty": 0.2}`;
 
     const userPrompt = `[用户说]\n${userInput}\n\n输出 JSON：`;
 
@@ -412,10 +511,18 @@ class RealLLMClient implements LLMClient {
     };
     const raw = data.choices?.[0]?.message?.content?.trim() ?? '{}';
 
-    const parsed = parseCandidateJson(raw);
-    // 关键词校正：当文本中有强烈的侮辱/赞美关键词时，覆盖 LLM 的误分类
+    // 回复文本与提取结果共用同一段 JSON 输出
+    const text = parseResponseText(raw);
+    const extraction = parseExtraction(raw);
+    // 关键词校正：当文本中有强烈的侮辱/赞美/安抚关键词时，覆盖 LLM 的误分类
     // 这是对小模型意图提取不可靠的安全网，LLM 仍是主要提取器
-    return correctActionByKeywords(userInput, parsed);
+    const corrected = correctExtractionByKeywords(userInput, extraction);
+    return {
+      text,
+      action: corrected.action,
+      intensity: corrected.intensity,
+      extraction: corrected,
+    };
   }
 }
 
@@ -424,24 +531,39 @@ class RealLLMClient implements LLMClient {
  *
  * 仅在关键词证据非常明确时才覆盖，避免过度干预。
  * LLM 仍是主要意图提取器，这只是安全网。
+ * 关键词命中是确定性证据，覆盖时将置信度提升到至少 0.6。
  */
-function correctActionByKeywords(
+function correctExtractionByKeywords(
   text: string,
-  candidate: CandidateBehavior,
-): CandidateBehavior {
+  extraction: ExtractionResult,
+): ExtractionResult {
+  const confident = (e: ExtractionResult): ExtractionResult =>
+    e.confidence < 0.6 ? { ...e, confidence: 0.6 } : e;
   // 强侮辱关键词 → 强制 insult
   if (/(混蛋|废物|傻逼|脑残|去死|滚蛋|讨厌你|垃圾)/.test(text)) {
-    return { ...candidate, action: 'insult', intensity: Math.max(candidate.intensity, 0.7) };
+    return confident({
+      ...extraction,
+      action: 'insult',
+      intensity: Math.max(extraction.intensity, 0.7),
+    });
   }
   // 强赞美关键词 → 强制 compliment
   if (/(超级喜欢|最爱你|你真棒|太厉害了|好喜欢你|爱死你)/.test(text)) {
-    return { ...candidate, action: 'compliment', intensity: Math.max(candidate.intensity, 0.7) };
+    return confident({
+      ...extraction,
+      action: 'compliment',
+      intensity: Math.max(extraction.intensity, 0.7),
+    });
   }
-  // 安抚关键词 → 强制 comfort（当 LLM 误分类为 statement 时纠正）
-  if (candidate.action !== 'comfort' && /(别怕|不怕|有我在|我在这|陪着你|陪你|别担心|没事的|没事啊|乖|摸摸头|抱抱|别害怕|有我呢)/.test(text)) {
-    return { ...candidate, action: 'comfort', intensity: Math.max(candidate.intensity, 0.6) };
+  // 安抚关键词 → 强制 comfort（当 LLM 误分类为其他类型时纠正）
+  if (extraction.action !== 'comfort' && /(别怕|不怕|有我在|我在这|陪着你|陪你|别担心|没事的|没事啊|乖|摸摸头|抱抱|别害怕|有我呢)/.test(text)) {
+    return confident({
+      ...extraction,
+      action: 'comfort',
+      intensity: Math.max(extraction.intensity, 0.6),
+    });
   }
-  return candidate;
+  return extraction;
 }
 
 /** 合法的对话行为类型集合（用于校验 LLM 输出） */
@@ -452,39 +574,24 @@ const VALID_ACTIONS = new Set<DialogueAction>([
 ]);
 
 /**
- * 从 LLM 原始输出中解析候选行为 JSON
+ * 从 LLM 原始输出中解析回复文本（text 字段）
  *
  * 容错处理：LLM 可能输出带 markdown 代码块或额外文字的 JSON。
- * action 不在合法集合中时降级为 'unknown'。
+ * 解析失败时回退为原始输出的前 100 字符。
+ * 提取字段（action/intensity/confidence/facts/uncertainty）由 parseExtraction 负责。
  */
-function parseCandidateJson(raw: string): CandidateBehavior {
-  // 尝试提取 JSON 对象
+function parseResponseText(raw: string): string {
   const jsonMatch = raw.match(/\{[\s\S]*\}/);
   const jsonStr = jsonMatch ? jsonMatch[0] : raw;
 
   try {
-    const parsed = JSON.parse(jsonStr) as {
-      text?: unknown;
-      action?: unknown;
-      intensity?: unknown;
-    };
-    const text =
-      typeof parsed.text === 'string' && parsed.text.length > 0
-        ? parsed.text
-        : '...';
-    const rawAction = typeof parsed.action === 'string' ? parsed.action : 'unknown';
-    const action: DialogueAction = VALID_ACTIONS.has(rawAction as DialogueAction)
-      ? (rawAction as DialogueAction)
-      : 'unknown';
-    const intensity =
-      typeof parsed.intensity === 'number'
-        ? Math.max(0, Math.min(1, parsed.intensity))
-        : 0.3;
-
-    return { text, action, intensity };
+    const parsed = JSON.parse(jsonStr) as { text?: unknown };
+    if (typeof parsed.text === 'string' && parsed.text.length > 0) {
+      return parsed.text;
+    }
+    return '...';
   } catch {
-    // 解析失败，降级为纯文本 + unknown action
-    return { text: raw.slice(0, 100), action: 'unknown', intensity: 0.3 };
+    return raw.slice(0, 100);
   }
 }
 
@@ -541,8 +648,18 @@ class MockLLMClient implements LLMClient {
     // 从用户输入中提取客观行为类型（mock 版意图提取）
     // 注意：这里只做客观分类，情绪效价由 appraisal.ts 计算
     const { action, intensity } = extractActionMock(userInput);
+    // mock 提取是确定性规则匹配：命中明确规则时置信度中等，
+    // 落默认 statement 时置信度较低（没有真实语义理解）
+    const confidence = action === 'statement' ? 0.4 : 0.6;
+    const extraction: ExtractionResult = {
+      action,
+      intensity,
+      confidence,
+      facts: [],
+      uncertainty: 1 - confidence,
+    };
 
-    return { text, action, intensity };
+    return { text, action, intensity, extraction };
   }
 }
 

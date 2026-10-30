@@ -42,7 +42,13 @@ export const ACTION_VALUES: Record<DialogueAction, number> = {
   unknown: 0.0,
 };
 
-/** 评价模块需要的动态状态输入 */
+/**
+ * 评价模块需要的动态状态输入
+ *
+ * 阶段四收尾扩展：
+ * - confidence：观察置信度（来自 ObservationEvent），低置信时情绪冲击线性衰减
+ * - evidenceAssociationIds：被唤醒记忆的 ID 列表（证据链溯源）
+ */
 export interface AppraisalContext {
   /** 动态关联权重（由记忆聚合演化，初始 1.0） */
   associationWeight: number;
@@ -63,12 +69,26 @@ export interface AppraisalContext {
    * - agreeableness：反比调制负面行为的信任扣除（宜人性越低，被伤得越狠）
    */
   traits: PersonalityTraits;
+  /**
+   * 观察置信度 0-1（来自 ObservationEvent，调用方传入；默认 1.0）
+   * 低置信时 valenceDelta/arousalDelta 线性衰减（不确定的话影响小）
+   */
+  confidence?: number;
+  /**
+   * 被唤醒记忆的 ID 列表（没有则为空数组）
+   * 仅作证据链记录，不参与计算
+   */
+  evidenceAssociationIds?: string[];
 }
 
-/** 评价结果 */
+/** 评价结果（阶段四收尾：多维化） */
 export interface AppraisalResult {
-  /** 对 mood_baseline 的影响量 */
-  moodDelta: number;
+  /** 对 mood_baseline 的效价影响量（原 moodDelta 改名，语义更准确） */
+  valenceDelta: number;
+  /** 对 arousal 的唤醒影响量（0 或正值，由行为强度与效价绝对值决定） */
+  arousalDelta: number;
+  /** 对 energy 的影响量（预留扩展；当前能量消耗由 DialogueEvent 计算） */
+  energyDelta: number;
   /** 对 energy 的消耗（对话是物理事件） */
   energyCost: number;
   /** 对信任度 trust 的影响量（正行为增、负行为减） */
@@ -79,6 +99,10 @@ export interface AppraisalResult {
     novelty: number;
     security: number;
   };
+  /** 观察置信度（透传，供 AppraisalEvent 记录） */
+  confidence: number;
+  /** 被唤醒记忆的 ID 列表（透传，供 AppraisalEvent 记录） */
+  evidenceAssociationIds: string[];
 }
 
 /** 单次对话的基础能量消耗 */
@@ -102,6 +126,14 @@ const SNOW_CARBON_NEED_THRESHOLD = 80;
 const SNOW_CARBON_MOOD_THRESHOLD = 25;
 /** 雪中送炭：额外心情加成 */
 const SNOW_CARBON_BONUS = 12;
+
+/** 低置信阈值：观察置信度低于此值时，情绪冲击线性衰减 */
+const LOW_CONFIDENCE_THRESHOLD = 0.4;
+/** arousalDelta 的缩放系数（行为效价绝对值 × 强度 × 此系数 × 信任归一化） */
+const AROUSAL_DELTA_SCALE = 15;
+/** arousalDelta 的上下界（clamp 到 [-30, 30]） */
+const AROUSAL_DELTA_MIN = -30;
+const AROUSAL_DELTA_MAX = 30;
 
 /**
  * 核心评价函数
@@ -129,6 +161,9 @@ export function appraise(
   const actionValue = ACTION_VALUES[action] ?? 0;
   const safeIntensity = Math.max(0, Math.min(1, intensity));
   const trustMultiplier = context.trust / 50;
+  // 观察置信度（默认 1.0，兼容旧调用方）
+  const confidence = Math.max(0, Math.min(1, context.confidence ?? 1.0));
+  const evidenceAssociationIds = context.evidenceAssociationIds ?? [];
 
   // === 需求满足度判定 ===
   // 每种行为类型满足/刺激不同的心理需求
@@ -190,18 +225,35 @@ export function appraise(
     needMoodBonus += SNOW_CARBON_BONUS * safeIntensity;
   }
 
-  let moodDelta = actionMood + needMoodBonus;
+  let valenceDelta = actionMood + needMoodBonus;
 
   // === 防御墙：拦截正向安抚（听不进好话） ===
-  // 作用于总 moodDelta（含需求满足加成与雪中送炭），而非仅 action 分量：
+  // 作用于总效价增量（含需求满足加成与雪中送炭），而非仅 action 分量：
   // 防御姿态下，连"久旱逢甘霖"的安抚也会被挡在墙外。
-  if (moodDelta > 0 && context.defensiveness > DEFENSIVENESS_WALL_THRESHOLD) {
-    moodDelta *= DEFENSIVE_COMFORT_KEEP_RATIO;
+  if (valenceDelta > 0 && context.defensiveness > DEFENSIVENESS_WALL_THRESHOLD) {
+    valenceDelta *= DEFENSIVE_COMFORT_KEEP_RATIO;
     // 极度防御：好话被解读为敷衍/别有用心，确定性地反转为轻微负向
     if (context.defensiveness > DEFENSIVENESS_PERFUNCTORY_THRESHOLD) {
-      moodDelta = -Math.abs(actionValue) * safeIntensity * PERFUNCTORY_REVERSE_RATIO;
+      valenceDelta = -Math.abs(actionValue) * safeIntensity * PERFUNCTORY_REVERSE_RATIO;
     }
   }
+
+  // === 低置信衰减：观察不确定时，情绪冲击线性减弱 ===
+  // confidence < 0.4 时，valenceDelta × (confidence / 0.4)——
+  // 确定性衰减，不引入随机数，保证回放一致。
+  if (confidence < LOW_CONFIDENCE_THRESHOLD) {
+    valenceDelta *= confidence / LOW_CONFIDENCE_THRESHOLD;
+  }
+
+  // === arousalDelta：行为强度与效价绝对值驱动唤醒度 ===
+  // 与 valenceDelta 独立：强烈的侮辱或赞美都会拉高 arousal（心跳加速），
+  // 而 valenceDelta 决定心情往哪个方向走。同样受低置信衰减。
+  let arousalDelta =
+    Math.abs(actionValue) * safeIntensity * AROUSAL_DELTA_SCALE * trustMultiplier;
+  if (confidence < LOW_CONFIDENCE_THRESHOLD) {
+    arousalDelta *= confidence / LOW_CONFIDENCE_THRESHOLD;
+  }
+  arousalDelta = clamp(arousalDelta, AROUSAL_DELTA_MIN, AROUSAL_DELTA_MAX);
 
   // 能量消耗：基础消耗 + 强度加成
   const energyCost = DIALOGUE_BASE_ENERGY_COST + safeIntensity * 1.5;
@@ -221,7 +273,9 @@ export function appraise(
   );
 
   return {
-    moodDelta,
+    valenceDelta,
+    arousalDelta,
+    energyDelta: 0, // 预留扩展；当前能量消耗由 DialogueEvent 计算
     energyCost,
     trustDelta,
     needDeltas: {
@@ -229,6 +283,8 @@ export function appraise(
       novelty: noveltyDelta,
       security: securityDelta,
     },
+    confidence,
+    evidenceAssociationIds,
   };
 }
 

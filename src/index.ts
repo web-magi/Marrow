@@ -493,7 +493,8 @@ async function main(): Promise<void> {
     }
 
     // 3. 环境传感器 → 缓慢调制 mood_baseline
-    //    温度/湿度/光照以小时级时间常数影响心境
+    //    架构要求：温度/湿度/光照以小时级时间常数缓慢调制 mood_baseline 漂移方向
+    //    每 tick moodDelta 控制在 ±0.0125，每小时累积约 ±4.5 点
     const env = sensors.environment.read();
     // 舒适温度范围 18-26°C，偏离越大 mood 影响越大
     const tempComfort = 1 - Math.min(1, Math.abs(env.temperature - 22) / 15);
@@ -507,7 +508,7 @@ async function main(): Promise<void> {
       payload: {
         feature: 'environment',
         reading: env.temperature,
-        moodDelta: envMoodDelta * 0.1, // 缓慢调制，每 tick 小量变化
+        moodDelta: envMoodDelta * 0.01, // 小时级时间常数，缓慢调制
         salience: 0.05,
       },
     };

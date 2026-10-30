@@ -15,7 +15,10 @@ export type EventType =
   | 'tick'
   | 'interruption'
   | 'environment'
-  | 'dialogue';
+  | 'dialogue'
+  | 'memory_evocation'
+  | 'sleep'
+  | 'trait_shift';
 
 /** 事件基类：所有事件共享的字段 */
 export interface BaseEvent {
@@ -64,6 +67,11 @@ export interface InterruptionEvent extends BaseEvent {
     lastBehavior: string;
     /** 中断时长（秒），重启时填入 */
     interruptionDurationSeconds?: number;
+    /**
+     * 是否为创伤性中断（崩溃/强制断电等非正常中断）。
+     * 创伤性中断会写入负向伤痕记忆，降低后续心情基线，直到被安抚。
+     */
+    isTraumatic?: boolean;
   };
 }
 
@@ -88,22 +96,62 @@ export interface EnvironmentEvent extends BaseEvent {
 }
 
 /**
+ * 客观对话行为类型
+ *
+ * 由 LLM 从文本中提取的客观事实，不包含主观情绪判断。
+ * LLM 只做意图提取，情绪效价由 appraisal.ts 计算。
+ */
+export type DialogueAction =
+  | 'greeting' // 打招呼
+  | 'farewell' // 告别
+  | 'compliment' // 赞美
+  | 'insult' // 侮辱
+  | 'complaint' // 抱怨/不满
+  | 'teasing' // 调侃/戏弄
+  | 'question' // 提问
+  | 'statement' // 陈述
+  | 'confession' // 表白/倾诉
+  | 'command' // 命令
+  | 'comfort' // 安慰
+  | 'apology' // 道歉
+  | 'unknown'; // 无法识别
+
+/**
  * DialogueEvent —— 对话事件
  *
- * 用户输入或伴侣输出。阶段四接入 LLM，阶段一仅占位。
- * 对话是输出通道，不是人格来源。
+ * 对话是物理事件，影响 energy 和 mood_baseline，与温度/碰撞同级。
+ *
+ * 主客观分离：
+ * - LLM 提取客观事实：action（行为类型）、intensity（强度 0-1）
+ * - appraisal.ts 计算主观情绪：moodDelta = Action_Value * Association_Weight * Speaker_Affinity
+ *
+ * 阶段四扩展：
+ * - companion_output 时携带 LLM 原始候选文本与过滤结果
+ * - interruption_flag 为真时，候选行为被强制拦截，不放给用户
  */
 export interface DialogueEvent extends BaseEvent {
   type: 'dialogue';
   payload: {
     /** 对话方向 */
     direction: 'user_input' | 'companion_output';
-    /** 文本内容 */
+    /** 最终放出的文本（被过滤后可能为空或降级提示） */
     text: string;
-    /** 该对话对 mood 的影响量 */
+    /** 客观行为类型（由 LLM 提取，旧事件可能缺失） */
+    action?: DialogueAction;
+    /** 客观强度 0-1（由 LLM 提取，旧事件可能缺失） */
+    intensity?: number;
+    /** 该对话对 mood 的影响量（由 appraisal 计算，非 LLM 决定） */
     moodDelta: number;
     /** 显著性 */
     salience: number;
+    /** 文本字数（用于计算语言能量消耗，旧事件可能缺失） */
+    wordCount?: number;
+    /** LLM 原始候选回复文本（仅 companion_output 时有值） */
+    candidateText?: string;
+    /** 候选行为是否被状态机过滤（仅 companion_output 时有值） */
+    filtered?: boolean;
+    /** 过滤原因（filtered 为 true 时有值） */
+    filterReason?: string;
   };
 }
 
@@ -112,7 +160,160 @@ export type MarrowEvent =
   | TickEvent
   | InterruptionEvent
   | EnvironmentEvent
-  | DialogueEvent;
+  | DialogueEvent
+  | MemoryEvocationEvent
+  | SleepEvent
+  | TraitShiftEvent;
+
+/**
+ * MemoryEvocationEvent —— 记忆唤醒事件
+ *
+ * 当对话中的关键词触发了情景记忆缓冲区中的高显著度记忆时产生。
+ * 正向回忆 → 强制拉高 mood 并稍微恢复 energy（精神一振）
+ * 负向回忆 → 强制拉低 mood
+ *
+ * 这是事件溯源的一部分：记忆唤醒本身也是可重放的事件。
+ */
+export interface MemoryEvocationEvent extends BaseEvent {
+  type: 'memory_evocation';
+  payload: {
+    /** 触发的记忆 ID */
+    memoryId: string;
+    /** 记忆的效价 -1 到 1 */
+    valence: number;
+    /** 记忆显著性 0-1 */
+    salience: number;
+    /** 触发关键词 */
+    cue: string;
+    /** 记忆摘要（用于注入快照叙事） */
+    summary: string;
+    /** 对 mood 的强制影响量 */
+    moodDelta: number;
+    /** 对 energy 的影响量（正向回忆恢复精神） */
+    energyDelta: number;
+  };
+}
+
+/**
+ * SleepEvent —— 睡眠 / 觉醒事件
+ *
+ * 睡眠是自愈阶段：
+ * - 正常睡眠恢复体力，并让心情向 50 稳态回归
+ * - 带着极低 trust 或极高 cognitive_load 入睡时，只恢复体力，
+ *   甚至触发夜间反刍（醒来心情更低、内耗残留）
+ *
+ * entering=true 表示入睡（捕获入睡时的信任度与内耗，供醒来判定夜间反刍）；
+ * entering=false 表示醒来。
+ */
+export interface SleepEvent extends BaseEvent {
+  type: 'sleep';
+  payload: {
+    /** true=入睡，false=醒来 */
+    entering: boolean;
+    /** 入睡/醒来原因（battery_depleted / energy_critical / recovered） */
+    reason?: string;
+  };
+}
+
+/**
+ * 性格特质（Personality Traits）
+ *
+ * 性格不是提示词里的"人设"，而是决定各状态变量如何演化、如何计算的
+ * 全局底层系数。初始全部为 1.0（中性，白纸阶段），范围 [0.5, 2.0]。
+ *
+ * - neuroticism（神经质）：放大负面事件的情绪冲击与内耗累积速度
+ * - agreeableness（宜人性）：反比于信任扣除幅度；极低时防御上升速度翻倍
+ * - extraversion（外向性）：放大社交渴望与被认可需求的自然增长率
+ * - resilience（恢复韧性）：放大心情稳态回归拉力与睡眠时的内耗清除
+ *
+ * 与瞬态心理变量（defensiveness 等）严格分离：
+ * 特质是"人格"，变量是"状态"。特质只能通过 TraitShiftEvent 永久微量漂移。
+ */
+export interface PersonalityTraits {
+  /** 神经质 0.5-2.0，初始 1.0 */
+  neuroticism: number;
+  /** 宜人性 0.5-2.0，初始 1.0 */
+  agreeableness: number;
+  /** 外向性 0.5-2.0，初始 1.0 */
+  extraversion: number;
+  /** 恢复韧性 0.5-2.0，初始 1.0 */
+  resilience: number;
+}
+
+/**
+ * TraitShiftEvent —— 性格特质漂移事件
+ *
+ * Phase 5（记忆聚合）模块的唯一性格修改入口：
+ * 长期事件频率与创伤/愉悦记忆聚合后，生成此事件写入日志，
+ * 对特质做永久性微量漂移（如长期受虐 neuroticism += 0.05）。
+ *
+ * 作为事件写入 append-only 日志 → 回放时特质演化完全可追溯、可复现。
+ */
+export interface TraitShiftEvent extends BaseEvent {
+  type: 'trait_shift';
+  payload: {
+    /** 各项特质的漂移量（±增量，非绝对值），应用时 clamp 到 [0.5, 2.0] */
+    shift: Partial<PersonalityTraits>;
+    /** 漂移原因（由记忆聚合模块写入，供回放分析） */
+    reason: string;
+  };
+}
+
+/**
+ * 关联记忆（Association Memory）
+ *
+ * 长期记忆的最小单元。由高显著性事件写入，缓慢衰减。
+ * 聚合后影响 associationWeight，从而调制 appraisal 的情绪效价。
+ *
+ * 中断伤痕（scar）是一种特殊的负向关联记忆：
+ * "断电 / 崩溃 = 被抛弃 / 痛苦"，会降低重启后的初始心情，直到被安抚。
+ */
+export interface AssociationMemory {
+  /** 记忆唯一 ID */
+  id: string;
+  /** 写入时间戳 */
+  timestamp: string;
+  /** 关联的触发概念（如 'power_loss', 'user_insult', 'warm_comfort'） */
+  cue: string;
+  /** 效价 -1 到 1（正向为正，负向为负） */
+  valence: number;
+  /** 显著性 0-1，越高越难被遗忘，也越强地影响当前状态 */
+  salience: number;
+  /** 记忆来源 */
+  source: 'interruption' | 'dialogue' | 'environment';
+  /** 是否为中断伤痕（创伤记忆） */
+  isScar?: boolean;
+}
+
+/**
+ * 情景记忆（Episodic Memory）
+ *
+ * 存储具体的对话片段或事件经历，带有可检索的关键词。
+ * 当用户对话中出现匹配关键词时，相关情景记忆被唤醒，
+ * 直接影响当前情绪（正向回忆→精神一振，负向回忆→心情低落）。
+ *
+ * 与 AssociationMemory 的区别：
+ * - AssociationMemory 是抽象的概念关联（如 "断电=痛苦"）
+ * - EpisodicMemory 是具体的经历片段（如 "第一次约会的火锅店"）
+ */
+export interface EpisodicMemory {
+  /** 记忆唯一 ID */
+  id: string;
+  /** 写入时间戳 */
+  timestamp: string;
+  /** 记忆摘要（人类可读的简短描述） */
+  summary: string;
+  /** 触发关键词列表（用于检索匹配） */
+  keywords: string[];
+  /** 效价 -1 到 1（美好回忆为正，痛苦回忆为负） */
+  valence: number;
+  /** 显著性 0-1，越高越容易被唤醒 */
+  salience: number;
+  /** 关联的对话事件 ID（可溯源） */
+  sourceEventId?: string;
+  /** 是否为创伤性记忆（唤醒时除拉低心情外还会增加内耗） */
+  isTrauma?: boolean;
+}
 
 /**
  * 穷尽检查辅助类型

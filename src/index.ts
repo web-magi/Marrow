@@ -13,6 +13,8 @@
  */
 
 import { createServer } from 'node:http';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { createInitialState, applyEvent, type MarrowState } from './state.js';
 import {
   type TickEvent,
@@ -27,6 +29,45 @@ import {
   type SimulatedMotionSensor,
   type SimulatedBatterySensor,
 } from './sensors.js';
+import { createLLMClient, buildStateSnapshot, type LLMClient } from './llm.js';
+import { filterCandidateBehavior } from './dialogue.js';
+import type { DialogueEvent, SleepEvent } from './events.js';
+
+/**
+ * 轻量 .env 加载器
+ *
+ * 读取项目根目录的 .env 文件，将 KEY=VALUE 写入 process.env。
+ * 不覆盖已存在的环境变量（命令行传入的优先级更高）。
+ * 无额外依赖，兼容本地开发与部署。
+ */
+function loadEnvFile(): void {
+  const envPath = join(process.cwd(), '.env');
+  if (!existsSync(envPath)) return;
+
+  const content = readFileSync(envPath, 'utf-8');
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx === -1) continue;
+    const key = trimmed.slice(0, eqIdx).trim();
+    let value = trimmed.slice(eqIdx + 1).trim();
+    // 去除首尾引号
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    // 不覆盖已存在的环境变量
+    if (process.env[key] === undefined) {
+      process.env[key] = value;
+    }
+  }
+}
+
+// 在读取任何环境变量之前加载 .env
+loadEnvFile();
 
 /** tick 间隔（毫秒） */
 const TICK_INTERVAL_MS = 10_000;
@@ -55,6 +96,20 @@ let currentState: MarrowState | null = null;
 
 /** 状态历史缓冲区 */
 const stateHistory: MarrowState[] = [];
+
+/** 对话历史缓冲区（用于监控页面展示） */
+interface DialogueMessage {
+  direction: 'user_input' | 'companion_output';
+  text: string;
+  timestamp: string;
+  filtered?: boolean;
+  filterReason?: string;
+}
+const dialogueHistory: DialogueMessage[] = [];
+const DIALOGUE_HISTORY_SIZE = 100;
+
+/** LLM 客户端（阶段四） */
+let llmClient: LLMClient | null = null;
 
 /** 格式化状态输出 */
 function formatState(state: MarrowState): string {
@@ -86,6 +141,147 @@ function createTickEvent(deltaSeconds: number): TickEvent {
   };
 }
 
+/**
+ * 处理对话请求（阶段四）
+ *
+ * 流程（主客观分离）：
+ * 1. LLM 从用户输入提取客观事实（action、intensity）+ 生成回复文本
+ * 2. 写入用户输入事件（携带 action/intensity）
+ * 3. applyEvent 调用 appraisal 计算主观情绪（moodDelta），不依赖 LLM
+ * 4. 状态机过滤候选行为（interruption_flag 强制拦截）
+ * 5. 写入伴侣输出事件
+ *
+ * 关键：LLM 不决定情绪效价，状态机（appraisal）决定。
+ */
+async function handleChatRequest(
+  req: import('node:http').IncomingMessage,
+  res: import('node:http').ServerResponse,
+): Promise<void> {
+  // 读取请求体
+  let body = '';
+  for await (const chunk of req) {
+    body += chunk;
+  }
+
+  let userInput = '';
+  try {
+    const parsed = JSON.parse(body) as { message?: string };
+    userInput = (parsed.message ?? '').trim();
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'invalid JSON body' }));
+    return;
+  }
+
+  if (!userInput) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'message is required' }));
+    return;
+  }
+
+  if (!currentState || !llmClient) {
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'system not ready' }));
+    return;
+  }
+
+  const state = currentState;
+  const timestamp = new Date().toISOString();
+
+  // 1. 调用 LLM：提取客观事实（action、intensity）+ 生成回复文本
+  //    LLM 只做意图提取和文本渲染，不计算情绪效价
+  const snapshot = buildStateSnapshot(state);
+  let candidate: { text: string; action: import('./events.js').DialogueAction; intensity: number };
+  try {
+    candidate = await llmClient.generateResponse(snapshot, userInput);
+  } catch (err) {
+    console.error('[LLM] generateResponse failed:', err);
+    candidate = { text: '...（暂时无法回应）', action: 'unknown', intensity: 0.3 };
+  }
+
+  // 2. 写入用户输入事件（携带客观 action/intensity，moodDelta 由 appraisal 计算）
+  const userEvent: DialogueEvent = {
+    type: 'dialogue',
+    id: generateEventId(),
+    timestamp,
+    payload: {
+      direction: 'user_input',
+      text: userInput,
+      action: candidate.action,
+      intensity: candidate.intensity,
+      moodDelta: 0, // 由 applyEvent 中的 appraisal 覆盖计算
+      salience: 0.3,
+      wordCount: userInput.length,
+    },
+  };
+  appendEvent(userEvent);
+  // applyDialogue 内部调用 appraisal，基于 action/intensity 计算 moodDelta 并更新 mood/energy/trust
+  const stateAfterUser = applyEvent(state, userEvent);
+
+  // 3. 状态机过滤候选行为（interruption_flag 强制拦截）
+  const filterResult = filterCandidateBehavior(stateAfterUser, candidate);
+
+  // 4. 写入伴侣输出事件（携带候选文本与过滤结果）
+  //    伴侣输出不改变自己的 mood（moodDelta=0），只消耗少量 energy
+  const companionEvent: DialogueEvent = {
+    type: 'dialogue',
+    id: generateEventId(),
+    timestamp: new Date().toISOString(),
+    payload: {
+      direction: 'companion_output',
+      text: filterResult.text,
+      moodDelta: 0,
+      salience: 0.3,
+      wordCount: filterResult.text.length,
+      candidateText: candidate.text,
+      filtered: filterResult.filtered,
+      filterReason: filterResult.filterReason || undefined,
+    },
+  };
+  appendEvent(companionEvent);
+  const finalState = applyEvent(stateAfterUser, companionEvent);
+
+  // 更新全局状态
+  currentState = finalState;
+  stateHistory.push(finalState);
+  if (stateHistory.length > HISTORY_SIZE) stateHistory.shift();
+
+  // 记录对话历史
+  dialogueHistory.push({
+    direction: 'user_input',
+    text: userInput,
+    timestamp,
+  });
+  dialogueHistory.push({
+    direction: 'companion_output',
+    text: filterResult.text,
+    timestamp: companionEvent.timestamp,
+    filtered: filterResult.filtered,
+    filterReason: filterResult.filterReason || undefined,
+  });
+  while (dialogueHistory.length > DIALOGUE_HISTORY_SIZE) {
+    dialogueHistory.shift();
+  }
+
+  if (filterResult.filtered) {
+    console.log(
+      `[CHAT] filtered (${filterResult.filterReason}): ` +
+        `candidate="${candidate.text.slice(0, 30)}..." → emitted="${filterResult.text}"`,
+    );
+  } else {
+    console.log(`[CHAT] user: "${userInput.slice(0, 30)}" → companion: "${filterResult.text.slice(0, 30)}"`);
+  }
+
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(
+    JSON.stringify({
+      reply: filterResult.text,
+      filtered: filterResult.filtered,
+      filterReason: filterResult.filterReason || null,
+    }),
+  );
+}
+
 /** 监控页面 HTML */
 const MONITOR_HTML = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -103,10 +299,10 @@ const MONITOR_HTML = `<!DOCTYPE html>
       padding: 20px;
     }
     h1 { margin-bottom: 8px; font-size: 24px; }
-    .subtitle { color: #94a3b8; margin-bottom: 20px; font-size: 14px; }
+    .subtitle { color: #94a3b8; margin-bottom: 8px; font-size: 14px; }
     .status-bar {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
       gap: 12px;
       margin-bottom: 20px;
     }
@@ -121,7 +317,45 @@ const MONITOR_HTML = `<!DOCTYPE html>
     .status-card .value.mood { color: #a855f7; }
     .status-card .value.arousal { color: #ef4444; }
     .status-card .value.behavior { color: #22c55e; }
-    .status-card .value.battery { color: #f59e0b; }
+    /* 性格底色面板：固定右下角，特质演化的唯一观察窗口 */
+    .traits-panel {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      background: rgba(30, 27, 75, 0.92);
+      border: 1px solid #6366f1;
+      border-radius: 10px;
+      padding: 12px 16px;
+      font-size: 12px;
+      line-height: 1.8;
+      color: #c4b5fd;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+      z-index: 100;
+      min-width: 150px;
+    }
+    .traits-panel .traits-title {
+      font-size: 11px;
+      color: #818cf8;
+      letter-spacing: 2px;
+      margin-bottom: 4px;
+    }
+    .traits-panel .trait-row { display: flex; justify-content: space-between; gap: 12px; }
+    .traits-panel .trait-value { font-weight: bold; color: #e0e7ff; }
+    .traits-panel .traits-note { font-size: 10px; color: #64748b; margin-top: 4px; }
+    /* 心情核心卡片：突出每时每刻的心情演化 */
+    .mood-hero {
+      background: linear-gradient(135deg, #1e1b4b 0%, #312e81 100%);
+      border: 1px solid #6366f1;
+      grid-column: span 2;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .mood-hero .label { font-size: 14px; color: #c4b5fd; letter-spacing: 2px; }
+    .mood-hero .value { font-size: 56px; color: #a855f7; text-shadow: 0 0 20px rgba(168,85,247,0.5); }
+    .mood-hero .mood-desc { font-size: 18px; color: #e2e8f0; margin-top: 4px; }
     .chart-container {
       background: #1e293b;
       border-radius: 12px;
@@ -163,41 +397,76 @@ const MONITOR_HTML = `<!DOCTYPE html>
 </head>
 <body>
   <h1>Marrow — 实时监控 <span class="live-dot"></span></h1>
-  <p class="subtitle">阶段三：环境与中断接入 · 数据每秒刷新 · <span id="timeScale"></span></p>
+  <p class="subtitle">阶段四：对话作为输出通道 · 数据每秒刷新 · <span id="timeScale"></span></p>
+
+  <!-- 性格底色面板：特质系数是性格演化的唯一观察窗口（fixed 定位，与 DOM 位置无关） -->
+  <div class="traits-panel">
+    <div class="traits-title">性 格 底 色</div>
+    <div class="trait-row"><span>神经质</span><span class="trait-value" id="traitNeuroticism">--</span></div>
+    <div class="trait-row"><span>宜人性</span><span class="trait-value" id="traitAgreeableness">--</span></div>
+    <div class="trait-row"><span>外向性</span><span class="trait-value" id="traitExtraversion">--</span></div>
+    <div class="trait-row"><span>恢复韧性</span><span class="trait-value" id="traitResilience">--</span></div>
+    <div class="traits-note" id="traitsNote"></div>
+  </div>
 
   <div class="status-bar">
+    <div class="status-card mood-hero">
+      <div class="label">心 情</div>
+      <div class="value" id="mood">--</div>
+      <div class="mood-desc" id="moodDesc">--</div>
+    </div>
     <div class="status-card">
-      <div class="label">Energy</div>
+      <div class="label">体力</div>
       <div class="value energy" id="energy">--</div>
     </div>
     <div class="status-card">
-      <div class="label">Mood Baseline</div>
-      <div class="value mood" id="mood">--</div>
-    </div>
-    <div class="status-card">
-      <div class="label">Arousal</div>
+      <div class="label">唤醒度</div>
       <div class="value arousal" id="arousal">--</div>
     </div>
     <div class="status-card">
-      <div class="label">Battery</div>
-      <div class="value battery" id="battery">--</div>
+      <div class="label">信任度</div>
+      <div class="value" id="trust" style="color:#06b6d4;">--</div>
     </div>
     <div class="status-card">
-      <div class="label">Behavior</div>
+      <div class="label">防御度</div>
+      <div class="value" id="defensiveness" style="color:#f43f5e;">--</div>
+    </div>
+    <div class="status-card">
+      <div class="label">内耗值</div>
+      <div class="value" id="cognitiveLoad" style="color:#e11d48;">--</div>
+    </div>
+    <div class="status-card">
+      <div class="label">注意力</div>
+      <div class="value" id="attention" style="color:#f59e0b;">--</div>
+    </div>
+    <div class="status-card">
+      <div class="label">社交渴望</div>
+      <div class="value" id="socialHunger" style="color:#ec4899;">--</div>
+    </div>
+    <div class="status-card">
+      <div class="label">被认可需求</div>
+      <div class="value" id="needValidation" style="color:#a855f7;">--</div>
+    </div>
+    <div class="status-card">
+      <div class="label">新鲜感需求</div>
+      <div class="value" id="needNovelty" style="color:#06b6d4;">--</div>
+    </div>
+    <div class="status-card">
+      <div class="label">安全感需求</div>
+      <div class="value" id="needSecurity" style="color:#f97316;">--</div>
+    </div>
+    <div class="status-card">
+      <div class="label">伤痕</div>
+      <div class="value" id="scars" style="color:#ef4444;">--</div>
+    </div>
+    <div class="status-card">
+      <div class="label">行为</div>
       <div class="value behavior" id="behavior" style="font-size:18px;">--</div>
-    </div>
-    <div class="status-card">
-      <div class="label">Uptime</div>
-      <div class="value" id="uptime" style="font-size:18px;">--</div>
-    </div>
-    <div class="status-card">
-      <div class="label">Interruptions</div>
-      <div class="value" id="interruptions" style="font-size:18px;">--</div>
     </div>
   </div>
 
   <div class="chart-container">
-    <h2>状态曲线（实时）</h2>
+    <h2>心情演化曲线（每时每刻）</h2>
     <canvas id="stateChart" height="100"></canvas>
   </div>
 
@@ -205,6 +474,16 @@ const MONITOR_HTML = `<!DOCTYPE html>
     <h2>行为时间轴（最近 100 个状态）</h2>
     <div class="timeline-bar" id="timelineBar"></div>
     <div class="legend" id="legend"></div>
+  </div>
+
+  <div class="chart-container">
+    <h2>对话（阶段四：对话作为输出通道）</h2>
+    <div id="chatBox" style="height:240px;overflow-y:auto;background:#0f172a;border-radius:8px;padding:12px;margin-bottom:12px;font-size:14px;line-height:1.6;"></div>
+    <div style="display:flex;gap:8px;">
+      <input id="chatInput" type="text" placeholder="输入消息..." style="flex:1;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:10px 14px;border-radius:8px;font-size:14px;outline:none;" />
+      <button id="chatSend" style="background:#3b82f6;color:white;border:none;padding:10px 20px;border-radius:8px;cursor:pointer;font-size:14px;">发送</button>
+    </div>
+    <p style="color:#64748b;font-size:12px;margin-top:8px;">提示：中断恢复期（arousal 高）消息会被强制拦截，只显示恢复期提示。</p>
   </div>
 
   <script>
@@ -216,6 +495,14 @@ const MONITOR_HTML = `<!DOCTYPE html>
       idle: '待机', active: '活跃', rest: '休息',
       quiet: '沉静', interrupted: '中断'
     };
+    // 心情数值 → 中文描述（每时每刻的心情状态）
+    function moodToChinese(mood) {
+      if (mood < 15) return '非常低落';
+      if (mood < 35) return '低落';
+      if (mood < 55) return '平静';
+      if (mood < 75) return '愉悦';
+      return '非常愉悦';
+    }
 
     const ctx = document.getElementById('stateChart').getContext('2d');
     const chart = new Chart(ctx, {
@@ -223,9 +510,9 @@ const MONITOR_HTML = `<!DOCTYPE html>
       data: {
         labels: [],
         datasets: [
-          { label: 'Energy', data: [], borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.1)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2 },
-          { label: 'Mood', data: [], borderColor: '#a855f7', backgroundColor: 'rgba(168,85,247,0.1)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2 },
-          { label: 'Arousal', data: [], borderColor: '#ef4444', backgroundColor: 'rgba(239,68,68,0.1)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 2 },
+          { label: '心情', data: [], borderColor: '#a855f7', backgroundColor: 'rgba(168,85,247,0.15)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 3 },
+          { label: '体力', data: [], borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.05)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
+          { label: '唤醒度', data: [], borderColor: '#ef4444', backgroundColor: 'rgba(239,68,68,0.05)', fill: true, tension: 0.3, pointRadius: 0, borderWidth: 1.5 },
         ],
       },
       options: {
@@ -248,20 +535,38 @@ const MONITOR_HTML = `<!DOCTYPE html>
 
         document.getElementById('energy').textContent = s.energy.toFixed(1);
         document.getElementById('mood').textContent = s.moodBaseline.toFixed(1);
+        document.getElementById('moodDesc').textContent = moodToChinese(s.moodBaseline);
         document.getElementById('arousal').textContent = s.arousal.toFixed(2);
-        document.getElementById('battery').textContent = (s.batteryLevel ?? 100).toFixed(1) + '%';
+        document.getElementById('trust').textContent = (s.trust ?? 100).toFixed(1);
+        document.getElementById('defensiveness').textContent = (s.defensiveness ?? 0).toFixed(1);
+        document.getElementById('cognitiveLoad').textContent = (s.cognitiveLoad ?? 0).toFixed(1);
+        document.getElementById('attention').textContent = ((s.attentionFocus ?? 0.5) * 100).toFixed(0) + '%';
+        document.getElementById('socialHunger').textContent = (s.socialHunger ?? 30).toFixed(1);
+        document.getElementById('needValidation').textContent = (s.needValidation ?? 40).toFixed(1);
+        document.getElementById('needNovelty').textContent = (s.needNovelty ?? 30).toFixed(1);
+        document.getElementById('needSecurity').textContent = (s.needSecurity ?? 50).toFixed(1);
+        document.getElementById('scars').textContent = s.interruptionScars ?? 0;
         document.getElementById('behavior').textContent = (BEHAVIOR_LABELS[s.lastBehavior.kind] || s.lastBehavior.kind) + ' · ' + s.lastBehavior.reason;
-        document.getElementById('uptime').textContent = Math.floor(s.uptimeSeconds) + 's';
-        document.getElementById('interruptions').textContent = s.interruptionCount;
+        // 性格底色面板：四系数两位小数；全 1.0（白纸未分化）时给出提示
+        const t = s.traits ?? { neuroticism: 1, agreeableness: 1, extraversion: 1, resilience: 1 };
+        document.getElementById('traitNeuroticism').textContent = t.neuroticism.toFixed(2);
+        document.getElementById('traitAgreeableness').textContent = t.agreeableness.toFixed(2);
+        document.getElementById('traitExtraversion').textContent = t.extraversion.toFixed(2);
+        document.getElementById('traitResilience').textContent = t.resilience.toFixed(2);
+        const undifferentiated =
+          Math.abs(t.neuroticism - 1) < 0.01 && Math.abs(t.agreeableness - 1) < 0.01 &&
+          Math.abs(t.extraversion - 1) < 0.01 && Math.abs(t.resilience - 1) < 0.01;
+        document.getElementById('traitsNote').textContent =
+          undifferentiated ? '白纸未分化 · 等待事件塑造' : '已在经历中悄悄改变';
         document.getElementById('timeScale').textContent = '时间加速 ' + data.timeScale + 'x';
 
-        // 更新曲线
+        // 更新曲线（心情优先，突出每时每刻的心情演化）
         chart.data.labels = hist.map(h => {
           const d = new Date(h.lastUpdated);
           return d.toLocaleTimeString('zh-CN', { hour12: false });
         });
-        chart.data.datasets[0].data = hist.map(h => h.energy);
-        chart.data.datasets[1].data = hist.map(h => h.moodBaseline);
+        chart.data.datasets[0].data = hist.map(h => h.moodBaseline);
+        chart.data.datasets[1].data = hist.map(h => h.energy);
         chart.data.datasets[2].data = hist.map(h => h.arousal);
         chart.update('none');
 
@@ -293,6 +598,77 @@ const MONITOR_HTML = `<!DOCTYPE html>
 
     fetchState();
     setInterval(fetchState, 1000);
+
+    // === 对话功能（阶段四）===
+    const chatBox = document.getElementById('chatBox');
+    const chatInput = document.getElementById('chatInput');
+    const chatSend = document.getElementById('chatSend');
+
+    function appendMessage(msg) {
+      const div = document.createElement('div');
+      div.style.marginBottom = '8px';
+      if (msg.direction === 'user_input') {
+        div.innerHTML = '<span style="color:#3b82f6;font-weight:bold;">你：</span>' + escapeHtml(msg.text);
+      } else {
+        let tag = '';
+        if (msg.filtered) {
+          const reason = msg.filterReason || 'filtered';
+          tag = ' <span style="color:#f59e0b;font-size:11px;">[已过滤:' + reason + ']</span>';
+        }
+        div.innerHTML = '<span style="color:#22c55e;font-weight:bold;">伴侣：</span>' + escapeHtml(msg.text) + tag;
+      }
+      chatBox.appendChild(div);
+      chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement('div');
+      div.textContent = str;
+      return div.innerHTML;
+    }
+
+    async function loadDialogue() {
+      try {
+        const res = await fetch('/api/dialogue');
+        const msgs = await res.json();
+        chatBox.innerHTML = '';
+        msgs.forEach(appendMessage);
+      } catch (e) { /* ignore */ }
+    }
+
+    async function sendMessage() {
+      const text = chatInput.value.trim();
+      if (!text) return;
+      chatInput.value = '';
+      chatSend.disabled = true;
+      try {
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: text })
+        });
+        const data = await res.json();
+        appendMessage({ direction: 'user_input', text });
+        appendMessage({
+          direction: 'companion_output',
+          text: data.reply,
+          filtered: data.filtered,
+          filterReason: data.filterReason
+        });
+      } catch (e) {
+        appendMessage({ direction: 'companion_output', text: '（发送失败）' });
+      } finally {
+        chatSend.disabled = false;
+        chatInput.focus();
+      }
+    }
+
+    chatSend.addEventListener('click', sendMessage);
+    chatInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') sendMessage();
+    });
+
+    loadDialogue();
   </script>
 </body>
 </html>`;
@@ -322,6 +698,14 @@ function startMonitorServer(sensors: SensorProvider): void {
       batterySensor.setLevel(level);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, level }));
+    } else if (req.url === '/api/chat' && req.method === 'POST') {
+      // 阶段四：对话端点
+      // 接收用户输入 → LLM 生成候选 → 状态机过滤 → 写入事件 → 返回回复
+      handleChatRequest(req, res);
+    } else if (req.url === '/api/dialogue') {
+      // 返回对话历史
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(dialogueHistory));
     } else if (req.url === '/' || req.url === '/index.html') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(MONITOR_HTML);
@@ -335,6 +719,8 @@ function startMonitorServer(sensors: SensorProvider): void {
     console.log(`Monitor server: http://localhost:${MONITOR_PORT}`);
     console.log(`  POST /api/collision       - trigger collision`);
     console.log(`  POST /api/battery?level=N - set battery level`);
+    console.log(`  POST /api/chat            - send message ({"message":"..."})`);
+    console.log(`  GET  /api/dialogue        - get dialogue history`);
   });
 }
 
@@ -347,7 +733,7 @@ function startMonitorServer(sensors: SensorProvider): void {
  * 4. 应用事件，输出状态，持久化
  */
 async function main(): Promise<void> {
-  console.log('=== Marrow Phase 1: Minimal State Machine ===');
+  console.log('=== Marrow Phase 4: Dialogue as Output Channel ===');
   console.log(`Tick interval: ${TICK_INTERVAL_MS}ms`);
   console.log(`Time scale: ${TIME_SCALE}x (each tick simulates ${(TICK_INTERVAL_MS / 1000 * TIME_SCALE).toFixed(0)}s)`);
   if (TIME_SCALE > 1) {
@@ -377,6 +763,10 @@ async function main(): Promise<void> {
   // 初始化模拟传感器（阶段三）
   // 阶段六接入真实 MCU（ESP32）时替换为真实实现
   const sensors: SensorProvider = createSimulatedSensors();
+
+  // 初始化 LLM 客户端（阶段四）
+  // 配置 LLM_API_KEY 环境变量使用真实 API，否则使用 mock
+  llmClient = createLLMClient();
 
   // 启动监控服务器
   startMonitorServer(sensors);
@@ -443,7 +833,25 @@ async function main(): Promise<void> {
       stateHistory.shift();
     }
 
-    // 电池耗尽 → 触发休眠中断
+    // 电池恢复 → 唤醒（结束睡眠/夜间反刍）
+    if (battery.level >= 20 && state.sleeping) {
+      const wakeEvent: SleepEvent = {
+        type: 'sleep',
+        id: generateEventId(),
+        timestamp: new Date().toISOString(),
+        payload: { entering: false, reason: 'battery_recovered' },
+      };
+      appendEvent(wakeEvent);
+      state = applyEvent(state, wakeEvent);
+      currentState = state;
+      stateHistory.push(state);
+      if (stateHistory.length > HISTORY_SIZE) {
+        stateHistory.shift();
+      }
+      console.log(`[SLEEP] battery recovered, waking up`);
+    }
+
+    // 电池耗尽 → 触发休眠中断（创伤性：断电=被抛弃）
     if (battery.level < 2 && state.lastBehavior.kind !== 'interrupted') {
       const sleepInterruption: InterruptionEvent = {
         type: 'interruption',
@@ -455,10 +863,22 @@ async function main(): Promise<void> {
           moodBaselineAtInterruption: state.moodBaseline,
           arousalAtInterruption: state.arousal,
           lastBehavior: state.lastBehavior.kind,
+          isTraumatic: true,
         },
       };
       appendEvent(sleepInterruption);
       state = applyEvent(state, sleepInterruption);
+
+      // 入睡事件：冻结入睡时的信任度与内耗（供夜间反刍判定）
+      const sleepOnset: SleepEvent = {
+        type: 'sleep',
+        id: generateEventId(),
+        timestamp: new Date().toISOString(),
+        payload: { entering: true, reason: 'battery_depleted' },
+      };
+      appendEvent(sleepOnset);
+      state = applyEvent(state, sleepOnset);
+
       currentState = state;
       stateHistory.push(state);
       if (stateHistory.length > HISTORY_SIZE) {

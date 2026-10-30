@@ -9,12 +9,20 @@
     "start": "node dist/index.js",
     "dev": "tsc --watch",
     "test": "tsc && node --test \"dist/__tests__/*.test.js\"",
+    "db:migrate": "tsc && node dist/db/migrate.js",
     "run:phase1": "tsc && node dist/index.js"
   },
-  "keywords": ["ai-companion", "state-machine", "event-sourcing"],
+  "keywords": [
+    "ai-companion",
+    "state-machine",
+    "event-sourcing"
+  ],
   "author": "web-magi",
   "license": "MIT",
   "devDependencies": {
     "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "postgres": "^4.0.0"
   }
 }

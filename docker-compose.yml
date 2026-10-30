@@ -1,0 +1,31 @@
+# Marrow M1 — PostgreSQL EventStore 基础设施
+#
+# 用途：事件溯源的唯一正式写入存储（M1.2 起切换）。
+# 数据持久化在命名 volume marrow-pgdata 中，容器删除不丢数据。
+#
+# 启动：docker compose up -d
+# 健康检查：docker compose ps（healthy 表示可接受连接）
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: marrow-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-marrow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-marrow}
+      POSTGRES_DB: ${POSTGRES_DB:-marrow}
+    ports:
+      # 宿主 55432 -> 容器 5432，避开本地可能存在的 PostgreSQL 默认端口
+      - "${POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - marrow-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-marrow} -d $${POSTGRES_DB:-marrow}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  marrow-pgdata:

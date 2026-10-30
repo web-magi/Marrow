@@ -7,7 +7,9 @@
 
 import { createInitialState, applyEvent, type MarrowState } from './state.js';
 import type { TickEvent } from './events.js';
-import { generateEventId } from './storage.js';
+import { generateEventId, appendEvent, EVENT_LOG_PATH } from './storage.js';
+import { parseArgs } from 'node:util';
+import { writeFileSync, existsSync } from 'node:fs';
 
 /** 模拟时长（秒） */
 const SIMULATION_SECONDS = 24 * 60 * 60; // 24 小时
@@ -39,7 +41,22 @@ function formatState(state: MarrowState): string {
 }
 
 function main(): void {
+  const args = parseArgs({
+    options: {
+      write: { type: 'boolean' },
+    },
+  });
+  const writeToLog = args.values.write === true;
+
   console.log('=== Marrow Phase 1: 24h Simulation ===\n');
+
+  // 如果写入日志，先清空现有事件
+  if (writeToLog) {
+    if (existsSync(EVENT_LOG_PATH)) {
+      writeFileSync(EVENT_LOG_PATH, '', 'utf-8');
+    }
+    console.log('Writing events to log...');
+  }
 
   const startTime = new Date();
   let state = createInitialState(startTime.toISOString());
@@ -58,6 +75,9 @@ function main(): void {
     ).toISOString();
 
     const event = createTickEvent(timestamp, TICK_SECONDS);
+    if (writeToLog) {
+      appendEvent(event);
+    }
     state = applyEvent(state, event);
 
     // 统计行为

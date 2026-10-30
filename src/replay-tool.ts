@@ -15,7 +15,7 @@
  */
 
 import { parseArgs } from 'node:util';
-import { loadEvents, EVENT_LOG_PATH } from './storage.js';
+import { loadEvents, IDENTITY_ID } from './storage.js';
 import {
   replayUntil,
   replayWithSnapshots,
@@ -96,7 +96,7 @@ function traceBehavior(states: MarrowState[], targetIndex: number): void {
   }
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const args = parseArgs({
     options: {
       until: { type: 'string' },
@@ -107,8 +107,8 @@ function main(): void {
     },
   });
 
-  console.log(`Loading events from: ${EVENT_LOG_PATH}`);
-  const events = loadEvents();
+  console.log(`Loading events from PostgreSQL (identity: ${IDENTITY_ID})...`);
+  const events = await loadEvents();
   console.log(`Loaded ${events.length} events.`);
   console.log('');
 
@@ -162,4 +162,7 @@ function main(): void {
   printSummary(states);
 }
 
-main();
+main().catch((err) => {
+  console.error('Fatal error:', err);
+  process.exit(1);
+});

@@ -264,7 +264,7 @@ function generateHtml(
 </html>`;
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const args = parseArgs({
     options: {
       output: { type: 'string', default: 'data/visualization.html' },
@@ -272,8 +272,8 @@ function main(): void {
   });
 
   const outputPath = args.values.output!;
-  console.log('Loading events...');
-  const events = loadEvents();
+  console.log('Loading events from PostgreSQL...');
+  const events = await loadEvents();
   console.log(`Loaded ${events.length} events.`);
 
   if (events.length === 0) {
@@ -316,4 +316,7 @@ function main(): void {
   console.log('Open it in a browser to view state curves and behavior timeline.');
 }
 
-main();
+main().catch((err) => {
+  console.error('Fatal error:', err);
+  process.exit(1);
+});

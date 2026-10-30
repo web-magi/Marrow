@@ -23,6 +23,7 @@ import {
 } from './events.js';
 import { replay } from './replay.js';
 import { appendEvent, loadEvents, generateEventId } from './storage.js';
+import { closeDb } from './db/connection.js';
 import {
   createSimulatedSensors,
   type SensorProvider,
@@ -232,148 +233,158 @@ async function handleChatRequest(
     };
   }
 
-  // 2. 写观察事件（纯事实记录，不驱动状态变化）
-  const observationEvent: ObservationEvent = {
-    type: 'observation',
-    id: generateEventId(),
-    timestamp,
-    payload: {
-      source: 'user_text',
-      content: userInput,
-      action: candidate.extraction.action,
-      intensity: candidate.extraction.intensity,
+  // 事件持久化段：写库失败必须中止本次请求（返回 500），绝不静默回退。
+  // 写前一致性：appendEvent 成功后才 applyEvent，保证内存状态始终是
+  // 已持久化事件流回放结果的一致前缀。
+  try {
+    // 2. 写观察事件（纯事实记录，不驱动状态变化）
+    const observationEvent: ObservationEvent = {
+      type: 'observation',
+      id: generateEventId(),
+      timestamp,
+      payload: {
+        source: 'user_text',
+        content: userInput,
+        action: candidate.extraction.action,
+        intensity: candidate.extraction.intensity,
+        confidence: candidate.extraction.confidence,
+        uncertainty: candidate.extraction.uncertainty,
+        facts: candidate.extraction.facts,
+        extractorVersion: EXTRACTOR_VERSION,
+      },
+    };
+    await appendEvent(observationEvent);
+    const stateAfterObservation = applyEvent(state, observationEvent);
+
+    // 3. appraise：基于动态状态 + 观察置信度计算多维情绪增量
+    //    记忆唤醒证据链与 applyDialogue 内部逻辑保持一致的确定性检索
+    const evoked = evokeMemoryFromText(stateAfterObservation.episodicBuffer, userInput);
+    const appraisalContext: AppraisalContext = {
+      associationWeight: stateAfterObservation.associationWeight,
+      trust: stateAfterObservation.trust,
+      defensiveness: stateAfterObservation.defensiveness,
+      moodBaseline: stateAfterObservation.moodBaseline,
+      needValidation: stateAfterObservation.needValidation,
+      needNovelty: stateAfterObservation.needNovelty,
+      needSecurity: stateAfterObservation.needSecurity,
+      traits: stateAfterObservation.traits,
       confidence: candidate.extraction.confidence,
-      uncertainty: candidate.extraction.uncertainty,
-      facts: candidate.extraction.facts,
-      extractorVersion: EXTRACTOR_VERSION,
-    },
-  };
-  appendEvent(observationEvent);
-  const stateAfterObservation = applyEvent(state, observationEvent);
+      evidenceAssociationIds: evoked ? [evoked.id] : [],
+    };
+    const appraisalResult = appraise(
+      candidate.extraction.action,
+      candidate.extraction.intensity,
+      appraisalContext,
+    );
 
-  // 3. appraise：基于动态状态 + 观察置信度计算多维情绪增量
-  //    记忆唤醒证据链与 applyDialogue 内部逻辑保持一致的确定性检索
-  const evoked = evokeMemoryFromText(stateAfterObservation.episodicBuffer, userInput);
-  const appraisalContext: AppraisalContext = {
-    associationWeight: stateAfterObservation.associationWeight,
-    trust: stateAfterObservation.trust,
-    defensiveness: stateAfterObservation.defensiveness,
-    moodBaseline: stateAfterObservation.moodBaseline,
-    needValidation: stateAfterObservation.needValidation,
-    needNovelty: stateAfterObservation.needNovelty,
-    needSecurity: stateAfterObservation.needSecurity,
-    traits: stateAfterObservation.traits,
-    confidence: candidate.extraction.confidence,
-    evidenceAssociationIds: evoked ? [evoked.id] : [],
-  };
-  const appraisalResult = appraise(
-    candidate.extraction.action,
-    candidate.extraction.intensity,
-    appraisalContext,
-  );
+    // 4. 写评价事件（主观感受证据链；arousalDelta 由 applyAppraisal 应用）
+    const appraisalEvent: AppraisalEvent = {
+      type: 'appraisal',
+      id: generateEventId(),
+      timestamp: new Date().toISOString(),
+      payload: {
+        sourceObservationId: observationEvent.id,
+        valenceDelta: appraisalResult.valenceDelta,
+        arousalDelta: appraisalResult.arousalDelta,
+        energyDelta: appraisalResult.energyDelta,
+        confidence: appraisalResult.confidence,
+        evidenceAssociationIds: appraisalResult.evidenceAssociationIds,
+      },
+    };
+    await appendEvent(appraisalEvent);
+    const stateAfterAppraisal = applyEvent(stateAfterObservation, appraisalEvent);
 
-  // 4. 写评价事件（主观感受证据链；arousalDelta 由 applyAppraisal 应用）
-  const appraisalEvent: AppraisalEvent = {
-    type: 'appraisal',
-    id: generateEventId(),
-    timestamp: new Date().toISOString(),
-    payload: {
-      sourceObservationId: observationEvent.id,
-      valenceDelta: appraisalResult.valenceDelta,
-      arousalDelta: appraisalResult.arousalDelta,
-      energyDelta: appraisalResult.energyDelta,
-      confidence: appraisalResult.confidence,
-      evidenceAssociationIds: appraisalResult.evidenceAssociationIds,
-    },
-  };
-  appendEvent(appraisalEvent);
-  const stateAfterAppraisal = applyEvent(stateAfterObservation, appraisalEvent);
+    // 5. 写用户输入事件（携带观察/评价溯源 ID）
+    //    moodDelta = AppraisalResult.valenceDelta：回放时 applyDialogue 对新格式
+    //    事件直接采用该值，保证实跑与回放一致；旧格式事件仍由 appraisal 重算
+    const userEvent: DialogueEvent = {
+      type: 'dialogue',
+      id: generateEventId(),
+      timestamp,
+      payload: {
+        direction: 'user_input',
+        text: userInput,
+        action: candidate.extraction.action,
+        intensity: candidate.extraction.intensity,
+        moodDelta: appraisalResult.valenceDelta,
+        salience: 0.3,
+        wordCount: userInput.length,
+        observationId: observationEvent.id,
+        appraisalId: appraisalEvent.id,
+      },
+    };
+    await appendEvent(userEvent);
+    // applyDialogue 应用 mood/energy/trust/需求变化（新格式直接采用 payload.moodDelta）
+    const stateAfterUser = applyEvent(stateAfterAppraisal, userEvent);
 
-  // 5. 写用户输入事件（携带观察/评价溯源 ID）
-  //    moodDelta = AppraisalResult.valenceDelta：回放时 applyDialogue 对新格式
-  //    事件直接采用该值，保证实跑与回放一致；旧格式事件仍由 appraisal 重算
-  const userEvent: DialogueEvent = {
-    type: 'dialogue',
-    id: generateEventId(),
-    timestamp,
-    payload: {
+    // 6. 状态机过滤候选行为（interruption_flag 强制拦截）
+    const filterResult = filterCandidateBehavior(stateAfterUser, candidate);
+
+    // 7. 写入伴侣输出事件（携带候选文本与过滤结果）
+    //    伴侣输出不改变自己的 mood（moodDelta=0），只消耗少量 energy
+    const companionEvent: DialogueEvent = {
+      type: 'dialogue',
+      id: generateEventId(),
+      timestamp: new Date().toISOString(),
+      payload: {
+        direction: 'companion_output',
+        text: filterResult.text,
+        moodDelta: 0,
+        salience: 0.3,
+        wordCount: filterResult.text.length,
+        candidateText: candidate.text,
+        filtered: filterResult.filtered,
+        filterReason: filterResult.filterReason || undefined,
+      },
+    };
+    await appendEvent(companionEvent);
+    const finalState = applyEvent(stateAfterUser, companionEvent);
+
+    // 更新全局状态（所有事件均已持久化，内存状态与事件流一致）
+    currentState = finalState;
+    stateHistory.push(finalState);
+    if (stateHistory.length > HISTORY_SIZE) stateHistory.shift();
+
+    // 记录对话历史
+    dialogueHistory.push({
       direction: 'user_input',
       text: userInput,
-      action: candidate.extraction.action,
-      intensity: candidate.extraction.intensity,
-      moodDelta: appraisalResult.valenceDelta,
-      salience: 0.3,
-      wordCount: userInput.length,
-      observationId: observationEvent.id,
-      appraisalId: appraisalEvent.id,
-    },
-  };
-  appendEvent(userEvent);
-  // applyDialogue 应用 mood/energy/trust/需求变化（新格式直接采用 payload.moodDelta）
-  const stateAfterUser = applyEvent(stateAfterAppraisal, userEvent);
-
-  // 6. 状态机过滤候选行为（interruption_flag 强制拦截）
-  const filterResult = filterCandidateBehavior(stateAfterUser, candidate);
-
-  // 7. 写入伴侣输出事件（携带候选文本与过滤结果）
-  //    伴侣输出不改变自己的 mood（moodDelta=0），只消耗少量 energy
-  const companionEvent: DialogueEvent = {
-    type: 'dialogue',
-    id: generateEventId(),
-    timestamp: new Date().toISOString(),
-    payload: {
+      timestamp,
+    });
+    dialogueHistory.push({
       direction: 'companion_output',
       text: filterResult.text,
-      moodDelta: 0,
-      salience: 0.3,
-      wordCount: filterResult.text.length,
-      candidateText: candidate.text,
+      timestamp: companionEvent.timestamp,
       filtered: filterResult.filtered,
       filterReason: filterResult.filterReason || undefined,
-    },
-  };
-  appendEvent(companionEvent);
-  const finalState = applyEvent(stateAfterUser, companionEvent);
+    });
+    while (dialogueHistory.length > DIALOGUE_HISTORY_SIZE) {
+      dialogueHistory.shift();
+    }
 
-  // 更新全局状态
-  currentState = finalState;
-  stateHistory.push(finalState);
-  if (stateHistory.length > HISTORY_SIZE) stateHistory.shift();
+    if (filterResult.filtered) {
+      console.log(
+        `[CHAT] filtered (${filterResult.filterReason}): ` +
+          `candidate="${candidate.text.slice(0, 30)}..." → emitted="${filterResult.text}"`,
+      );
+    } else {
+      console.log(`[CHAT] user: "${userInput.slice(0, 30)}" → companion: "${filterResult.text.slice(0, 30)}"`);
+    }
 
-  // 记录对话历史
-  dialogueHistory.push({
-    direction: 'user_input',
-    text: userInput,
-    timestamp,
-  });
-  dialogueHistory.push({
-    direction: 'companion_output',
-    text: filterResult.text,
-    timestamp: companionEvent.timestamp,
-    filtered: filterResult.filtered,
-    filterReason: filterResult.filterReason || undefined,
-  });
-  while (dialogueHistory.length > DIALOGUE_HISTORY_SIZE) {
-    dialogueHistory.shift();
-  }
-
-  if (filterResult.filtered) {
-    console.log(
-      `[CHAT] filtered (${filterResult.filterReason}): ` +
-        `candidate="${candidate.text.slice(0, 30)}..." → emitted="${filterResult.text}"`,
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        reply: filterResult.text,
+        filtered: filterResult.filtered,
+        filterReason: filterResult.filterReason || null,
+      }),
     );
-  } else {
-    console.log(`[CHAT] user: "${userInput.slice(0, 30)}" → companion: "${filterResult.text.slice(0, 30)}"`);
+  } catch (err) {
+    // 写库失败：中止本次请求，不更新全局状态，绝不静默回退
+    console.error('[EventStore] 对话事件写入失败，中止本次请求:', err);
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'event persistence failed' }));
   }
-
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(
-    JSON.stringify({
-      reply: filterResult.text,
-      filtered: filterResult.filtered,
-      filterReason: filterResult.filterReason || null,
-    }),
-  );
 }
 
 /** 监控页面 HTML */
@@ -836,8 +847,8 @@ async function main(): Promise<void> {
   }
   console.log('Press Ctrl+C to stop.\n');
 
-  // 加载已有事件并重放
-  const existingEvents = loadEvents();
+  // 加载已有事件并重放（M1.2：唯一事件来源为 PostgreSQL events 表）
+  const existingEvents = await loadEvents();
   let state: MarrowState;
 
   if (existingEvents.length > 0) {
@@ -845,7 +856,7 @@ async function main(): Promise<void> {
     state = replay(existingEvents);
     console.log(`State restored. Uptime: ${Math.floor(state.uptimeSeconds)}s\n`);
   } else {
-    console.log('No existing events. Starting fresh.\n');
+    console.log('No existing events. Starting fresh (genesis).\n');
     state = createInitialState(new Date().toISOString());
   }
 
@@ -868,7 +879,9 @@ async function main(): Promise<void> {
   let lastTickTime = Date.now();
   let tickCount = 0;
 
-  const interval = setInterval(() => {
+  // tick 重入保护：上一次 tick 的写库尚未完成时跳过本次触发
+  let tickInFlight = false;
+  const runTick = async (): Promise<void> => {
     const now = Date.now();
     const realDelta = (now - lastTickTime) / 1000;
     lastTickTime = now;
@@ -887,7 +900,7 @@ async function main(): Promise<void> {
 
       // 只把第一个子步写入持久化日志（避免日志膨胀）
       if (i === 0) {
-        appendEvent(subTickEvent);
+        await appendEvent(subTickEvent);
       }
 
       state = applyEvent(state, subTickEvent);
@@ -919,7 +932,7 @@ async function main(): Promise<void> {
         salience: battery.level < 20 ? 0.8 : 0.1,
       },
     };
-    appendEvent(batteryEvent);
+    await appendEvent(batteryEvent);
     state = applyEvent(state, batteryEvent);
     currentState = state;
     stateHistory.push(state);
@@ -935,7 +948,7 @@ async function main(): Promise<void> {
         timestamp: new Date().toISOString(),
         payload: { entering: false, reason: 'battery_recovered' },
       };
-      appendEvent(wakeEvent);
+      await appendEvent(wakeEvent);
       state = applyEvent(state, wakeEvent);
       currentState = state;
       stateHistory.push(state);
@@ -960,7 +973,7 @@ async function main(): Promise<void> {
           isTraumatic: true,
         },
       };
-      appendEvent(sleepInterruption);
+      await appendEvent(sleepInterruption);
       state = applyEvent(state, sleepInterruption);
 
       // 入睡事件：冻结入睡时的信任度与内耗（供夜间反刍判定）
@@ -970,7 +983,7 @@ async function main(): Promise<void> {
         timestamp: new Date().toISOString(),
         payload: { entering: true, reason: 'battery_depleted' },
       };
-      appendEvent(sleepOnset);
+      await appendEvent(sleepOnset);
       state = applyEvent(state, sleepOnset);
 
       currentState = state;
@@ -996,7 +1009,7 @@ async function main(): Promise<void> {
           lastBehavior: state.lastBehavior.kind,
         },
       };
-      appendEvent(collisionInterruption);
+      await appendEvent(collisionInterruption);
       state = applyEvent(state, collisionInterruption);
       currentState = state;
       stateHistory.push(state);
@@ -1026,7 +1039,7 @@ async function main(): Promise<void> {
         salience: 0.05,
       },
     };
-    appendEvent(envEvent);
+    await appendEvent(envEvent);
     state = applyEvent(state, envEvent);
     currentState = state;
     stateHistory.push(state);
@@ -1046,14 +1059,28 @@ async function main(): Promise<void> {
       console.log(formatState(state));
       console.log('------------------------\n');
     }
+  };
+  const interval = setInterval(() => {
+    if (tickInFlight) return;
+    tickInFlight = true;
+    void runTick()
+      .catch((err) => {
+        // 写库失败：中止本次 tick（不静默回退 JSONL），状态机停在本 tick 起点，
+        // 已持久化的事件流仍是内存状态的一致前缀
+        console.error('[EventStore] tick 持久化失败，已中止本次 tick:', err);
+      })
+      .finally(() => {
+        tickInFlight = false;
+      });
   }, TICK_INTERVAL_MS);
 
   // 优雅关闭
-  const shutdown = (signal: string) => {
+  const shutdown = async (signal: string): Promise<void> => {
     console.log(`\nReceived ${signal}, shutting down...`);
     clearInterval(interval);
     console.log(`Final state: ${formatState(state)}`);
     console.log(`Total ticks: ${tickCount}`);
+    await closeDb();
     process.exit(0);
   };
 

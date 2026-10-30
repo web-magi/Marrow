@@ -689,8 +689,8 @@ V2 全新初始化：
 - [x] M0：确定性回放与观察—评价管道（ObservationEvent / AppraisalEvent、确定性伪随机、单元测试）
 - [x] M1.1：PostgreSQL 基础设施（docker-compose、events 表、迁移版本管理、连接模块）
 - [ ] M1.2：EventStore 迁移（异步写入、哈希链、并发安全、幂等、回放适配）
-- [ ] M1.3：V2 Fresh Start 初始化（替代原「V1 历史事件迁移」：全新 identity_id、空记忆与关联网络、genesis 事件、幂等初始化）
-- [ ] M1.4：V2 全新运行验收（替代原「正式切换」：实时状态与重启回放一致）
+- [ ] M1.3：V2 Fresh Start 初始化（全新 identity_id、空记忆与关联网络、genesis 事件、幂等初始化）
+- [ ] M1.4：V2 全新运行验收（实时状态与重启回放一致）
 
 M1.3 验收要求：
 

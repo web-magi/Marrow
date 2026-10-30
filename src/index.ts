@@ -354,18 +354,30 @@ async function main(): Promise<void> {
     lastTickTime = now;
 
     // 应用时间缩放因子：真实时间 × 缩放 = 模拟时间
-    const deltaSeconds = realDelta * TIME_SCALE;
+    const totalDeltaSeconds = realDelta * TIME_SCALE;
 
-    const tickEvent = createTickEvent(deltaSeconds);
-    appendEvent(tickEvent);
+    // 子步进：把大 delta 拆成多个 ≤10 秒的小步
+    // 保证 arousal 指数衰减、mood 随机游走等过程的数值精度
+    const SUB_STEP_SECONDS = 10;
+    const numSubSteps = Math.max(1, Math.ceil(totalDeltaSeconds / SUB_STEP_SECONDS));
+    const subStepDelta = totalDeltaSeconds / numSubSteps;
 
-    state = applyEvent(state, tickEvent);
-    currentState = state;
-    stateHistory.push(state);
+    for (let i = 0; i < numSubSteps; i++) {
+      const subTickEvent = createTickEvent(subStepDelta);
 
-    // 限制历史缓冲区大小
-    if (stateHistory.length > HISTORY_SIZE) {
-      stateHistory.shift();
+      // 只把第一个子步写入持久化日志（避免日志膨胀）
+      if (i === 0) {
+        appendEvent(subTickEvent);
+      }
+
+      state = applyEvent(state, subTickEvent);
+      currentState = state;
+
+      // 每个子步都记录到历史缓冲区，让曲线更平滑
+      stateHistory.push(state);
+      if (stateHistory.length > HISTORY_SIZE) {
+        stateHistory.shift();
+      }
     }
 
     tickCount++;

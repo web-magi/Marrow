@@ -14,9 +14,19 @@
 
 import { createServer } from 'node:http';
 import { createInitialState, applyEvent, type MarrowState } from './state.js';
-import type { TickEvent } from './events.js';
+import {
+  type TickEvent,
+  type EnvironmentEvent,
+  type InterruptionEvent,
+} from './events.js';
 import { replay } from './replay.js';
 import { appendEvent, loadEvents, generateEventId } from './storage.js';
+import {
+  createSimulatedSensors,
+  type SensorProvider,
+  type SimulatedMotionSensor,
+  type SimulatedBatterySensor,
+} from './sensors.js';
 
 /** tick 间隔（毫秒） */
 const TICK_INTERVAL_MS = 10_000;
@@ -111,6 +121,7 @@ const MONITOR_HTML = `<!DOCTYPE html>
     .status-card .value.mood { color: #a855f7; }
     .status-card .value.arousal { color: #ef4444; }
     .status-card .value.behavior { color: #22c55e; }
+    .status-card .value.battery { color: #f59e0b; }
     .chart-container {
       background: #1e293b;
       border-radius: 12px;
@@ -152,7 +163,7 @@ const MONITOR_HTML = `<!DOCTYPE html>
 </head>
 <body>
   <h1>Marrow — 实时监控 <span class="live-dot"></span></h1>
-  <p class="subtitle">阶段一：最小状态机 · 数据每秒刷新 · <span id="timeScale"></span></p>
+  <p class="subtitle">阶段三：环境与中断接入 · 数据每秒刷新 · <span id="timeScale"></span></p>
 
   <div class="status-bar">
     <div class="status-card">
@@ -166,6 +177,10 @@ const MONITOR_HTML = `<!DOCTYPE html>
     <div class="status-card">
       <div class="label">Arousal</div>
       <div class="value arousal" id="arousal">--</div>
+    </div>
+    <div class="status-card">
+      <div class="label">Battery</div>
+      <div class="value battery" id="battery">--</div>
     </div>
     <div class="status-card">
       <div class="label">Behavior</div>
@@ -234,6 +249,7 @@ const MONITOR_HTML = `<!DOCTYPE html>
         document.getElementById('energy').textContent = s.energy.toFixed(1);
         document.getElementById('mood').textContent = s.moodBaseline.toFixed(1);
         document.getElementById('arousal').textContent = s.arousal.toFixed(2);
+        document.getElementById('battery').textContent = (s.batteryLevel ?? 100).toFixed(1) + '%';
         document.getElementById('behavior').textContent = (BEHAVIOR_LABELS[s.lastBehavior.kind] || s.lastBehavior.kind) + ' · ' + s.lastBehavior.reason;
         document.getElementById('uptime').textContent = Math.floor(s.uptimeSeconds) + 's';
         document.getElementById('interruptions').textContent = s.interruptionCount;
@@ -282,7 +298,7 @@ const MONITOR_HTML = `<!DOCTYPE html>
 </html>`;
 
 /** 启动 HTTP 监控服务器 */
-function startMonitorServer(): void {
+function startMonitorServer(sensors: SensorProvider): void {
   const server = createServer((req, res) => {
     if (req.url === '/api/state') {
       const response = {
@@ -292,6 +308,20 @@ function startMonitorServer(): void {
       };
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(response));
+    } else if (req.url === '/api/collision' && req.method === 'POST') {
+      // 测试端点：手动触发一次碰撞
+      const motionSensor = sensors.motion as SimulatedMotionSensor;
+      motionSensor.triggerCollision();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, message: 'collision triggered' }));
+    } else if (req.url?.startsWith('/api/battery') && req.method === 'POST') {
+      // 测试端点：设置电池电量
+      const url = new URL(req.url, `http://localhost:${MONITOR_PORT}`);
+      const level = parseFloat(url.searchParams.get('level') ?? '100');
+      const batterySensor = sensors.battery as SimulatedBatterySensor;
+      batterySensor.setLevel(level);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, level }));
     } else if (req.url === '/' || req.url === '/index.html') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(MONITOR_HTML);
@@ -303,6 +333,8 @@ function startMonitorServer(): void {
 
   server.listen(MONITOR_PORT, () => {
     console.log(`Monitor server: http://localhost:${MONITOR_PORT}`);
+    console.log(`  POST /api/collision       - trigger collision`);
+    console.log(`  POST /api/battery?level=N - set battery level`);
   });
 }
 
@@ -342,8 +374,12 @@ async function main(): Promise<void> {
 
   console.log(formatState(state));
 
+  // 初始化模拟传感器（阶段三）
+  // 阶段六接入真实 MCU（ESP32）时替换为真实实现
+  const sensors: SensorProvider = createSimulatedSensors();
+
   // 启动监控服务器
-  startMonitorServer();
+  startMonitorServer(sensors);
 
   let lastTickTime = Date.now();
   let tickCount = 0;
@@ -381,6 +417,107 @@ async function main(): Promise<void> {
     }
 
     tickCount++;
+
+    // === 阶段三：传感器数据接入 ===
+    // 在 tick 子步进之后，读取传感器并生成对应事件
+
+    // 1. 电池电量 → 更新 state.batteryLevel
+    //    电池耗尽时触发休眠中断
+    const battery = sensors.battery.read();
+    const batteryEvent: EnvironmentEvent = {
+      type: 'environment',
+      id: generateEventId(),
+      timestamp: new Date().toISOString(),
+      payload: {
+        feature: 'battery',
+        reading: battery.level,
+        moodDelta: 0,
+        salience: battery.level < 20 ? 0.8 : 0.1,
+      },
+    };
+    appendEvent(batteryEvent);
+    state = applyEvent(state, batteryEvent);
+    currentState = state;
+    stateHistory.push(state);
+    if (stateHistory.length > HISTORY_SIZE) {
+      stateHistory.shift();
+    }
+
+    // 电池耗尽 → 触发休眠中断
+    if (battery.level < 2 && state.lastBehavior.kind !== 'interrupted') {
+      const sleepInterruption: InterruptionEvent = {
+        type: 'interruption',
+        id: generateEventId(),
+        timestamp: new Date().toISOString(),
+        payload: {
+          reason: `battery_depleted: level ${battery.level.toFixed(1)}%, entering sleep`,
+          energyAtInterruption: state.energy,
+          moodBaselineAtInterruption: state.moodBaseline,
+          arousalAtInterruption: state.arousal,
+          lastBehavior: state.lastBehavior.kind,
+        },
+      };
+      appendEvent(sleepInterruption);
+      state = applyEvent(state, sleepInterruption);
+      currentState = state;
+      stateHistory.push(state);
+      if (stateHistory.length > HISTORY_SIZE) {
+        stateHistory.shift();
+      }
+      console.log(`[INTERRUPTION] battery depleted, entering sleep`);
+    }
+
+    // 2. 运动传感器 → 碰撞触发中断
+    const motion = sensors.motion.read();
+    if (motion.collision) {
+      const collisionInterruption: InterruptionEvent = {
+        type: 'interruption',
+        id: generateEventId(),
+        timestamp: new Date().toISOString(),
+        payload: {
+          reason: `collision: acceleration ${motion.magnitude.toFixed(1)} m/s² exceeded threshold`,
+          energyAtInterruption: state.energy,
+          moodBaselineAtInterruption: state.moodBaseline,
+          arousalAtInterruption: state.arousal,
+          lastBehavior: state.lastBehavior.kind,
+        },
+      };
+      appendEvent(collisionInterruption);
+      state = applyEvent(state, collisionInterruption);
+      currentState = state;
+      stateHistory.push(state);
+      if (stateHistory.length > HISTORY_SIZE) {
+        stateHistory.shift();
+      }
+      console.log(`[INTERRUPTION] collision detected (${motion.magnitude.toFixed(1)} m/s²)`);
+    }
+
+    // 3. 环境传感器 → 缓慢调制 mood_baseline
+    //    温度/湿度/光照以小时级时间常数影响心境
+    const env = sensors.environment.read();
+    // 舒适温度范围 18-26°C，偏离越大 mood 影响越大
+    const tempComfort = 1 - Math.min(1, Math.abs(env.temperature - 22) / 15);
+    // 光照影响：白天（强光）略正向，夜晚略负向
+    const lightEffect = (env.light - 500) / 1000; // -0.5 ~ 0.5
+    const envMoodDelta = (tempComfort - 0.5) * 2 + lightEffect * 0.5;
+    const envEvent: EnvironmentEvent = {
+      type: 'environment',
+      id: generateEventId(),
+      timestamp: new Date().toISOString(),
+      payload: {
+        feature: 'environment',
+        reading: env.temperature,
+        moodDelta: envMoodDelta * 0.1, // 缓慢调制，每 tick 小量变化
+        salience: 0.05,
+      },
+    };
+    appendEvent(envEvent);
+    state = applyEvent(state, envEvent);
+    currentState = state;
+    stateHistory.push(state);
+    if (stateHistory.length > HISTORY_SIZE) {
+      stateHistory.shift();
+    }
 
     // 每 6 次 tick（约 1 分钟）输出一次状态，避免刷屏
     if (tickCount % 6 === 0) {

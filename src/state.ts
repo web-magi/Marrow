@@ -46,6 +46,12 @@ export const STATE_CONSTANTS = {
   INTERRUPTION_RECOVERY_THRESHOLD: 30,
   /** energy 低于此值进入 rest */
   ENERGY_REST_THRESHOLD: 20,
+  /** 电池低电量阈值：低于此值 energy 衰减加快 */
+  BATTERY_LOW_THRESHOLD: 20,
+  /** 电池低电量时 energy 衰减倍率 */
+  BATTERY_LOW_DECAY_MULTIPLIER: 3,
+  /** 电池耗尽阈值：低于此值触发休眠中断 */
+  BATTERY_DEPLETED_THRESHOLD: 2,
 } as const;
 
 /** 行为输出类型（阶段一用规则映射，阶段四接入 LLM） */
@@ -70,6 +76,8 @@ export interface MarrowState {
   arousal: number;
   /** 中断标志：arousal 超阈值时置位，强制改变运行轨迹 */
   interruptionFlag: boolean;
+  /** 电池电量 0-100（真实约束，由传感器更新） */
+  batteryLevel: number;
   /** 最后一次行为输出 */
   lastBehavior: BehaviorOutput;
   /** 状态最后更新的时间戳 */
@@ -87,6 +95,7 @@ export function createInitialState(timestamp: string): MarrowState {
     moodBaseline: 50,
     arousal: 10,
     interruptionFlag: false,
+    batteryLevel: 100,
     lastBehavior: { kind: 'idle', reason: 'initial_state' },
     lastUpdated: timestamp,
     uptimeSeconds: 0,
@@ -112,10 +121,13 @@ function applyTick(state: MarrowState, event: TickEvent): MarrowState {
   const c = STATE_CONSTANTS;
 
   // energy：正常活动时衰减，rest 状态下自我恢复（身体的自我保护）
+  // 电池低电量时，energy 衰减加快（真实约束）
   const isResting = state.lastBehavior.kind === 'rest';
+  const isBatteryLow = state.batteryLevel < c.BATTERY_LOW_THRESHOLD;
+  const decayMultiplier = isBatteryLow ? c.BATTERY_LOW_DECAY_MULTIPLIER : 1;
   const energyDelta = isResting
     ? c.ENERGY_RECOVERY_PER_SECOND * delta
-    : -c.ENERGY_DECAY_PER_SECOND * delta;
+    : -c.ENERGY_DECAY_PER_SECOND * delta * decayMultiplier;
   const newEnergy = clamp(
     state.energy + energyDelta,
     c.ENERGY_MIN,
@@ -213,7 +225,7 @@ function applyEnvironment(
   event: EnvironmentEvent,
 ): MarrowState {
   const c = STATE_CONSTANTS;
-  const { moodDelta, salience } = event.payload;
+  const { feature, reading, moodDelta, salience } = event.payload;
 
   // mood_baseline 受环境事件调制
   const newMoodBaseline = clamp(
@@ -234,11 +246,18 @@ function applyEnvironment(
   const newInterruptionFlag =
     state.interruptionFlag || newArousal >= c.AROUSAL_INTERRUPTION_THRESHOLD;
 
+  // 电池电量通过环境事件更新（feature: 'battery'）
+  let newBatteryLevel = state.batteryLevel;
+  if (feature === 'battery') {
+    newBatteryLevel = clamp(reading, 0, 100);
+  }
+
   return {
     ...state,
     moodBaseline: newMoodBaseline,
     arousal: newArousal,
     interruptionFlag: newInterruptionFlag,
+    batteryLevel: newBatteryLevel,
     lastUpdated: event.timestamp,
   };
 }

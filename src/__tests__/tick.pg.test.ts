@@ -6,8 +6,9 @@
  * - 第 1 / 5 / 最后一条事件插入失败 → 整批回滚，数据库 0 条新增
  * - 失败后原链尾不变，重试同一批次可成功写入
  * - 批量写入与并发单条/其他批量写入不交错（同 identity 连续）
- * - executeTick 失败时 state / lastTickTime / tickCount 不推进，
- *   下一轮 tick 补偿时间差，重试成功后 replay == session.state
+ * - executeTick 失败时 state / lastTickTime / tickCount 不推进；
+ *   M1.2.4 起失败批次被冻结为 pendingBatch，下一轮原样重试（同 event_id，
+ *   幂等吸收 commit-unknown 重复），重试成功后 replay == session.state
  *
  * 全部使用真实 PostgreSQL，测试 identity 带统一前缀，结束后清理。
  * 数据库不可用时全部用例跳过（不影响纯逻辑测试）。
@@ -379,9 +380,15 @@ test('并发隔离：多个批量写入 + 单条写入不互相穿插', { skip }
 });
 
 // ==================================================================
-// 五、executeTick 原子发布
+// 五、executeTick 原子发布 + M1.2.4 pendingBatch 重试
 // ==================================================================
-test('tick 原子性：第 5 条事件失败 → DB 0 新增、内存/时间基准不变、下一轮补偿、重试后 Replay 一致', { skip }, async () => {
+//
+// 本用例在 M1.2.4 改写：旧语义是「失败后下一轮重建批次、放大 delta 补偿」，
+// 新语义是「失败批次冻结为 pendingBatch，下一轮原样重试（同 event_id）」。
+// 改写原因：旧语义在 commit-unknown 场景（服务端已提交但客户端未收到确认）
+// 下会因重建批次产生全新 event_id，导致同一逻辑 tick 被重复写入；
+// pendingBatch 借 appendEvents 的 ON CONFLICT 幂等语义吸收这种重复。
+test('tick 原子性：第 5 条事件失败 → DB 0 新增、内存/时间基准不变、原批次幂等重试、Replay 一致', { skip }, async () => {
   const sensors = createSimulatedSensors();
   const base = Date.now();
   const persist = (events: MarrowEvent[]): Promise<void> =>
@@ -412,8 +419,14 @@ test('tick 原子性：第 5 条事件失败 → DB 0 新增、内存/时间基�
   const rowsBeforeFail = await countRows(ID_TICK);
   const tailBeforeFail = await tailHash(ID_TICK);
 
-  const failPersist = (events: MarrowEvent[]): Promise<void> =>
-    appendEvents(corruptAt(events, 4), { identityId: ID_TICK });
+  // 捕获失败时尝试写入的原始批次（未损坏），供后续比对 event_id。
+  // 注意：不能声明为 `MarrowEvent[] | null = null` —— TS 不会追踪闭包内赋值，
+  // 会把变量窄化为 null，后续 assert.ok 后变成 never。
+  let attemptedEvents: MarrowEvent[] = [];
+  const failPersist = (events: MarrowEvent[]): Promise<void> => {
+    attemptedEvents = events;
+    return appendEvents(corruptAt(events, 4), { identityId: ID_TICK });
+  };
 
   await assert.rejects(
     executeTick(session, sensors, inbox, lastTickBeforeFail + 100_000, 1, failPersist),
@@ -429,16 +442,26 @@ test('tick 原子性：第 5 条事件失败 → DB 0 新增、内存/时间基�
   assert.equal(session.lastTickTime, lastTickBeforeFail, 'lastTickTime 不得推进');
   assert.deepEqual(session.state, stateBeforeFail, '内存状态必须与失败前完全一致');
 
+  // M1.2.4：失败批次必须被冻结为 pendingBatch
+  assert.ok(session.pendingBatch, '失败后必须缓存 pendingBatch');
+  assert.ok(attemptedEvents.length > 0, 'failPersist 必须已捕获尝试批次');
+  assert.deepEqual(
+    session.pendingBatch.events.map((e) => e.id),
+    attemptedEvents.map((e) => e.id),
+    'pendingBatch 必须冻结失败批次的全部 event_id',
+  );
+
   console.log(
     `[EVIDENCE] tick 第5条失败：DB rows ${rowsBeforeFail} → ${await countRows(ID_TICK)}；` +
       `链尾 ${String(tailBeforeFail).slice(0, 16)}… → ${String(await tailHash(ID_TICK)).slice(0, 16)}…；` +
       `tickCount ${tickCountBeforeFail} → ${session.tickCount}；` +
       `lastTickTime ${lastTickBeforeFail} → ${session.lastTickTime}；` +
-      `内存状态一致=${JSON.stringify(session.state) === JSON.stringify(stateBeforeFail)}`,
+      `pendingBatch=${session.pendingBatch.events.length} 条`,
   );
 
-  // ---- 第三次 tick：补偿上一轮失败的时间差 ----
-  const compensated = await executeTick(
+  // ---- 第三次 tick：原样重试冻结批次（不是重建 + 放大 delta） ----
+  // 传入的 now 被忽略，lastTickTime 推进到缓存批次的 now
+  const retried = await executeTick(
     session,
     sensors,
     inbox,
@@ -447,24 +470,49 @@ test('tick 原子性：第 5 条事件失败 → DB 0 新增、内存/时间基�
     persist,
   );
   assert.equal(
-    compensated.realDeltaSeconds,
-    300,
-    '补偿后的 delta 必须覆盖失败轮次（200 秒等待 → 从上次成功点算 300 秒）',
+    retried.realDeltaSeconds,
+    100,
+    '重试原批次：delta 不放大（100 秒，与失败批次构建时一致）',
+  );
+  assert.deepEqual(
+    retried.events.map((e) => e.id),
+    attemptedEvents.map((e) => e.id),
+    '重试必须使用与失败批次完全相同的 event_id（幂等吸收 commit-unknown）',
   );
   assert.equal(session.tickCount, tickCountBeforeFail + 1);
-
-  // ---- Replay 必须与运行状态完全一致 ----
-  const persistedEvents = await loadEvents(ID_TICK);
-  const replayed = replay(persistedEvents);
-  assert.deepEqual(replayed, session.state, 'Replay 结果必须与运行态内存状态一致');
-  verifyChain(await fetchRows(ID_TICK), ID_TICK);
-
-  console.log(
-    `[EVIDENCE] 补偿与重放：补偿 delta=${compensated.realDeltaSeconds}s；` +
-      `事件总数=${persistedEvents.length}；` +
-      `Replay 与运行态一致=${JSON.stringify(replayed) === JSON.stringify(session.state)}`,
+  assert.equal(session.lastTickTime, lastTickBeforeFail + 100_000);
+  assert.equal(session.pendingBatch, undefined, '重试成功后必须清除 pendingBatch');
+  assert.equal(
+    await countRows(ID_TICK),
+    rowsBeforeFail + retried.events.length,
+    '重试后事件数 = 首轮 + 重试批次（无重复）',
   );
 
-  // 最终事件数 = 首轮 12 + 补偿轮 32（300s → 30 子步 + 2）
-  assert.equal(persistedEvents.length, 12 + 32);
+  // ---- Replay 必须与运行状态完全一致 ----
+  let persistedEvents = await loadEvents(ID_TICK);
+  assert.deepEqual(replay(persistedEvents), session.state, 'Replay 结果必须与运行态内存状态一致');
+
+  // ---- 第四次 tick：正常推进，delta 从重试成功的时间基准起算 ----
+  const fourth = await executeTick(
+    session,
+    sensors,
+    inbox,
+    lastTickBeforeFail + 200_000,
+    1,
+    persist,
+  );
+  assert.equal(fourth.realDeltaSeconds, 100, '后续 tick 从缓存批次的 now 正常起算');
+
+  persistedEvents = await loadEvents(ID_TICK);
+  assert.deepEqual(replay(persistedEvents), session.state, '最终 Replay 与运行态一致');
+  verifyChain(await fetchRows(ID_TICK), ID_TICK);
+
+  // 最终事件数 = 首轮 12 + 重试批 12 + 第四轮 12（100s → 10 子步 + 2）
+  assert.equal(persistedEvents.length, 12 + 12 + 12);
+
+  console.log(
+    `[EVIDENCE] pendingBatch 重试：重试 delta=${retried.realDeltaSeconds}s（原批次冻结值）；` +
+      `event_id 复用=${retried.events[0]!.id === attemptedEvents[0]!.id}；` +
+      `事件总数=${persistedEvents.length}；Replay 一致=true`,
+  );
 });

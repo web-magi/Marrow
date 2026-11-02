@@ -415,6 +415,62 @@ export async function loadEvents(
 }
 
 /**
+ * 持久化事件行（M1.2.4 启动恢复专用）。
+ *
+ * 与 loadEvents 的区别：loadEvents 只返回 payload（丢失行级元数据），
+ * 本结构携带数据库行的全部不可变元数据——
+ * sequence / schema_version / engine_version / 哈希链字段，
+ * 供启动恢复做「按行自身版本」的兼容性校验与错误精确定位。
+ *
+ * sequence 以字符串表示（BIGSERIAL 可能超出 JS 安全整数）。
+ */
+export interface PersistedEventRow {
+  sequence: string;
+  event_id: string;
+  identity_id: string;
+  /** TIMESTAMPTZ 列：连接层配置 timezone=UTC，postgres.js 可能返回 string 或 Date */
+  timestamp: string | Date;
+  event_type: string;
+  schema_version: number;
+  engine_version: string | null;
+  causation_id: string | null;
+  correlation_id: string | null;
+  previous_event_hash: string | null;
+  event_hash: string;
+  payload: MarrowEvent;
+}
+
+/**
+ * 加载指定身份的全部持久化事件行（含行级元数据，按链顺序）。
+ *
+ * 只读查询，仅供 M1.2.4 启动恢复路径使用；
+ * 常规回放继续使用 loadEvents（只取 payload）。
+ */
+export async function loadEventRows(
+  identityId: string = IDENTITY_ID,
+): Promise<PersistedEventRow[]> {
+  const sql = getDb();
+  return await sql<PersistedEventRow[]>`
+    SELECT
+      sequence::text AS sequence,
+      event_id,
+      identity_id,
+      "timestamp",
+      event_type,
+      schema_version,
+      engine_version,
+      causation_id,
+      correlation_id,
+      previous_event_hash,
+      event_hash,
+      payload
+    FROM events
+    WHERE identity_id = ${identityId}
+    ORDER BY events.sequence ASC
+  `;
+}
+
+/**
  * 生成事件唯一 ID
  *
  * 格式：timestamp-random

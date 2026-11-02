@@ -16,8 +16,12 @@ import { createServer } from 'node:http';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInitialState, applyEvent, evokeMemoryFromText, type MarrowState } from './state.js';
-import { replay } from './replay.js';
-import { appendEvent, IDENTITY_ID, loadEvents, generateEventId } from './storage.js';
+import { appendEvents, IDENTITY_ID, generateEventId } from './storage.js';
+import {
+  acquireIdentityOwnership,
+  recoverIdentityOrThrow,
+  releaseIdentityOwnership,
+} from './recovery.js';
 import { executeTick, type TickSession } from './tick.js';
 import {
   assertObservationBarrier,
@@ -300,7 +304,7 @@ async function handleChatRequest(
       };
       const timestamp = stamp();
 
-    // 2. 写观察事件（纯事实记录，不驱动状态变化）
+    // 2. 构建观察事件（纯事实记录，不驱动状态变化）
     const observationEvent: ObservationEvent = {
       type: 'observation',
       id: generateEventId(),
@@ -316,7 +320,6 @@ async function handleChatRequest(
         extractorVersion: EXTRACTOR_VERSION,
       },
     };
-    await appendEvent(observationEvent);
     const stateAfterObservation = applyEvent(state, observationEvent);
 
     // 3. appraise：基于动态状态 + 观察置信度计算多维情绪增量
@@ -340,7 +343,7 @@ async function handleChatRequest(
       appraisalContext,
     );
 
-    // 4. 写评价事件（主观感受证据链；arousalDelta 由 applyAppraisal 应用）
+    // 4. 构建评价事件（主观感受证据链；arousalDelta 由 applyAppraisal 应用）
     const appraisalEvent: AppraisalEvent = {
       type: 'appraisal',
       id: generateEventId(),
@@ -354,10 +357,9 @@ async function handleChatRequest(
         evidenceAssociationIds: appraisalResult.evidenceAssociationIds,
       },
     };
-    await appendEvent(appraisalEvent);
     const stateAfterAppraisal = applyEvent(stateAfterObservation, appraisalEvent);
 
-    // 5. 写用户输入事件（携带观察/评价溯源 ID）
+    // 5. 构建用户输入事件（携带观察/评价溯源 ID）
     //    moodDelta = AppraisalResult.valenceDelta：回放时 applyDialogue 对新格式
     //    事件直接采用该值，保证实跑与回放一致；旧格式事件仍由 appraisal 重算
     const userEvent: DialogueEvent = {
@@ -377,14 +379,13 @@ async function handleChatRequest(
         appraisalId: appraisalEvent.id,
       },
     };
-    await appendEvent(userEvent);
     // applyDialogue 应用 mood/energy/trust/需求变化（新格式直接采用 payload.moodDelta）
     const stateAfterUser = applyEvent(stateAfterAppraisal, userEvent);
 
     // 6. 状态机过滤候选行为（interruption_flag 强制拦截）
     const filterResult = filterCandidateBehavior(stateAfterUser, candidate);
 
-    // 7. 写入伴侣输出事件（携带候选文本与过滤结果）
+    // 7. 构建伴侣输出事件（携带候选文本与过滤结果）
     //    伴侣输出不改变自己的 mood（moodDelta=0），只消耗少量 energy
     const companionEvent: DialogueEvent = {
       type: 'dialogue',
@@ -401,8 +402,16 @@ async function handleChatRequest(
         filterReason: filterResult.filterReason || undefined,
       },
     };
-    await appendEvent(companionEvent);
     const finalState = applyEvent(stateAfterUser, companionEvent);
+
+    // 8. M1.2.4：四个对话事件在同一事务中原子提交。
+    //    原实现是 4 次独立 appendEvent：中途失败会在事件日志中留下
+    //    不完整的对话（如只有 observation+appraisal），重启恢复时必须
+    //    按部分事件语义处理。单批提交后，「部分 Chat 事件」只能来自
+    //    本改动之前的历史日志，新代码不会再产生。
+    //    本地状态计算（appraise/filter/applyEvent 顺序）完全不变，
+    //    仅持久化边界从 4 次单条变为 1 次批量。
+    await appendEvents([observationEvent, appraisalEvent, userEvent, companionEvent]);
 
     // 更新全局状态（所有事件均已持久化，内存状态与事件流一致）
     currentState = finalState;
@@ -935,17 +944,29 @@ async function main(): Promise<void> {
   }
   console.log('Press Ctrl+C to stop.\n');
 
-  // 加载已有事件并重放（M1.2：唯一事件来源为 PostgreSQL events 表）
-  const existingEvents = await loadEvents();
+  // === M1.2.4 启动恢复（先恢复，再开放任何入口） ===
+  // 顺序：identity 所有权 → 哈希链验证 → 确定性 Replay → 状态校验。
+  // 任何一步失败都会抛出异常，main().catch 使进程以非零状态退出——
+  // HTTP 服务器 / Tick 调度器在本块之后才会启动，恢复失败时绝不提前开放。
+  await acquireIdentityOwnership(IDENTITY_ID);
+
+  const recovery = await recoverIdentityOrThrow(IDENTITY_ID);
   let state: MarrowState;
 
-  if (existingEvents.length > 0) {
-    console.log(`Loaded ${existingEvents.length} existing events, replaying...`);
-    state = replay(existingEvents);
-    console.log(`State restored. Uptime: ${Math.floor(state.uptimeSeconds)}s\n`);
-  } else {
-    console.log('No existing events. Starting fresh (genesis).\n');
+  if (recovery.verdict === 'empty') {
+    // 空事件链是合法的新身份：使用正式定义的 V2 初始状态，
+    // 不读取 V1 JSONL、不继承任何其他身份的状态
+    console.log('No existing events. Starting fresh (genesis, V2 初始状态).\n');
     state = createInitialState(new Date().toISOString());
+  } else {
+    state = recovery.finalState!;
+    console.log(
+      `Recovered ${recovery.eventCount} events (sequence ${recovery.firstSequence}..${recovery.lastSequence}), ` +
+        `last event at ${recovery.lastEventTimestamp}`,
+    );
+    // M1.2.4 停机边界：两次运行之间的停机期间不模拟任何身体/情绪/关系/记忆
+    // 变化（停机补偿属后续独立设计）。状态就是最后一个已持久化事件的状态。
+    console.log('[M1.2.4] 停机期间未模拟任何状态变化；新 Tick 从本次启动的时间基准开始。\n');
   }
 
   currentState = state;
@@ -967,6 +988,9 @@ async function main(): Promise<void> {
   // tick 会话：state / lastTickTime / tickCount 只有在批量事务提交成功后才推进
   const tickSession: TickSession = {
     state,
+    // M1.2.4 时间边界：lastTickTime 故意取本次进程启动时刻，而不是
+    // 最后一个历史事件的时间——停机期间不模拟，新 Tick 只覆盖本次运行
+    // 的真实时间；这不是缺陷，是本阶段明确定义的语义。
     lastTickTime: Date.now(),
     tickCount: 0,
   };
@@ -1081,6 +1105,9 @@ async function main(): Promise<void> {
       console.log(`running task 最终结局: ${outcome}`);
     }
 
+    // M1.2.4：先释放 identity 所有权锁（显式 unlock + 归还专用连接），
+    // 再关闭连接池——顺序反过来会让所有权锁依赖连接池关闭兜底
+    await releaseIdentityOwnership(IDENTITY_ID);
     await closeDb();
     console.log(`Final state: ${formatState(state)}`);
     console.log(`Total ticks: ${tickSession.tickCount}`);

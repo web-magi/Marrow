@@ -46,6 +46,23 @@ export interface TickSession {
   /** 上一次成功提交的 tick 的真实时间（毫秒） */
   lastTickTime: number;
   tickCount: number;
+  /**
+   * M1.2.4 commit-unknown 修复：上一轮已构建但持久化失败的批次缓存。
+   *
+   * 背景：appendEvents 提交后若连接中断，客户端收到错误但服务端可能
+   * 已经提交（commit-unknown）。旧实现重试时会重新构建批次，
+   * generateEventId() 产生全新 event_id → 同一逻辑 tick 被写成两条
+   * 不同事件，破坏「不重复应用已提交事件」的恢复语义。
+   *
+   * 修复：持久化失败时冻结本批次（事件 ID / 时间戳 / 内容 / 观测确认
+   * 清单全部不变），下一轮 tick 直接重试同一批次——
+   * 若上次实际已提交，appendEvents 的 ON CONFLICT 幂等语义逐条吸收，
+   * 不会新增任何行；若已回滚，则正常写入。
+   *
+   * 进程崩溃时 pendingBatch 随之丢失：未提交的事件本就不属于
+   * 已提交事件日志，重启恢复不补偿它们（正确语义）。
+   */
+  pendingBatch?: (TickBatch & { now: number; timeScale: number }) | undefined;
 }
 
 /** 一轮 tick 的完整批次 */
@@ -329,9 +346,15 @@ export async function buildTickBatch(
  *
  * 失败时异常向上抛出（不吞异常）：
  * - 同批次已插入的行随事务一起回滚
- * - 未确认观测保留在 Inbox 中，下一轮复用同一 ID / 时间戳 / 读数
+ * - 未确认观测保留在 Inbox 中，且批次被冻结到 session.pendingBatch
  * - session.state / lastTickTime / tickCount 均不变
- * - 下一轮 tick 以未推进的 lastTickTime 计算 delta，自然补偿失败的时间差
+ *
+ * M1.2.4 commit-unknown 语义：
+ * - 存在 pendingBatch 时跳过构建，直接重试同一批冻结事件（同 event_id），
+ *   appendEvents 的幂等语义吸收「服务端已提交但客户端未确认」的重复；
+ *   成功后 lastTickTime 推进到缓存批次的 now（不是本轮调用传入的 now）
+ * - 补偿语义从「重建批次 + 放大 delta」变为「重试原批次 + 后续 tick 正常
+ *   delta」：冻结批次的 delta 已覆盖其构建时的时间差，总模拟时长守恒
  *
  * @param inbox 观测收件箱（调用方必须与 Chat 屏障共用同一实例）
  * @param persist 持久化函数（默认 appendEvents；测试可注入真实 PG 故障）
@@ -345,10 +368,30 @@ export async function executeTick(
   persist: (events: MarrowEvent[]) => Promise<void> = (events) =>
     appendEvents(events),
 ): Promise<TickBatch> {
+  // 存在上次持久化失败的冻结批次：原样重试，不重新构建、不重新读取传感器
+  const pending = session.pendingBatch;
+  if (pending) {
+    await persist(pending.events); // 失败时保留 pendingBatch，直接上抛
+    for (const observationId of pending.observationIdsToConfirm) {
+      await inbox.confirm(observationId);
+    }
+    session.state = pending.nextState;
+    session.lastTickTime = pending.now;
+    session.tickCount += 1;
+    session.pendingBatch = undefined;
+    return pending;
+  }
+
   const batch = await buildTickBatch(session, sensors, inbox, now, timeScale);
 
-  // 整批单事务写入；任一条失败 → 抛出，以下确认与发布逻辑不会执行
-  await persist(batch.events);
+  try {
+    // 整批单事务写入；任一条失败 → 抛出，以下确认与发布逻辑不会执行
+    await persist(batch.events);
+  } catch (err) {
+    // 冻结本批次供下一轮原样重试（commit-unknown 防护，见 TickSession 注释）
+    session.pendingBatch = { ...batch, now, timeScale };
+    throw err;
+  }
 
   // 事务提交成功后才确认观测、推进内存状态与时间基准
   for (const observationId of batch.observationIdsToConfirm) {

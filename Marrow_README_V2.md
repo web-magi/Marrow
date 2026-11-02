@@ -653,6 +653,42 @@ V2 全新初始化：
 - 不允许通过清空数据库来掩盖 identity 隔离问题。
 - PostgreSQL 中不存在任何 V1 历史事件。
 
+### 4.6 M1.2.4 确定性 Replay 与重启恢复（已完成）
+
+PostgreSQL 中已成功提交的事件日志是恢复的唯一历史依据。进程正常关闭、异常退出或崩溃后重启，系统确定性地恢复到最后一个已持久化事件所代表的状态。
+
+**启动恢复路径**（src/index.ts `main()`）：
+
+```
+进程启动 → acquireIdentityOwnership（会话级 advisory lock，双参数命名空间）
+  → verifyEventChain（M1.2.3 只读哈希链验证，失败即拒绝启动）
+  → loadEventRows（携带行级 schema_version / engine_version 元数据）
+  → replayPersistedEvents（纯函数确定性重放，逐行版本/payload 校验）
+  → 恢复状态不变量校验
+  → valid：finalState 作为运行起点 / empty：V2 正式初始状态
+  → 初始化 RuntimeSession → 启动 Tick Scheduler → 开放 Chat / HTTP
+```
+
+恢复失败（哈希链损坏、未知事件类型、不支持的版本、payload 缺字段、不变量违例）必须阻止启动：抛出 `RecoveryError` 并以非零码退出。禁止清空数据、新建 identity、修复哈希链、跳过损坏事件或用默认状态顶替。
+
+**Replay 确定性红线**：不调用 LLM、不读传感器、不用 `Date.now()`/`Math.random()` 生成历史、不产生新事件。未知事件类型与缺失必要 payload 字段一律显式失败（`unknown_event_type` / `invalid_payload`），绝不静默跳过或用默认值兜底。`state.ts` 的 `applyEvent` 对未知类型静默返回的容错语义只适用于运行期；恢复层（`recovery.ts`）在校验阶段就拒绝。
+
+**历史版本兼容**：继承 D 阶段版本感知规则，每条事件按行自身 `schema_version` / `engine_version` 解释。当前支持 `schema_version ∈ {1, 2}`（1 = 早期 M1.2 PG 写入的未打版本行，payload 同为 V2 判别联合格式；V1 JSONL 从未导入 PG，不存在旧格式事件）与 `engine_version = null | marrow@*`。其余版本明确拒绝（`unsupported_schema_version` / `unsupported_engine_version`）。不存在猜测性的旧版本转换规则。
+
+**commit-unknown 处理**：Tick 持久化失败时，整批事件（含全部 event_id、观测确认 ID、时间基准）冻结为 `TickSession.pendingBatch` 原样重试，由 `appendEvents` 的 `ON CONFLICT (event_id)` 幂等吸收——服务端已提交但客户端报错时，重试零新增事件。进程崩溃导致 pendingBatch 丢失 = 该批次未提交，不属于恢复范围（语义正确）。测试：C15（commit-unknown 重试无重复事件）。
+
+**Chat 原子提交**：M1.2.4 起 Chat 的 observation / appraisal / user_input / companion_output 四事件合并为单个 `appendEvents` 批次，与 Tick 同级原子性。历史日志中的部分 Chat 事件（如只有 observation + appraisal）按每条事件独立语义确定性恢复：不伪造缺失事件、不自动补齐对话、不静默跳过，也不报错——观测推进时间轴、appraisal 应用增量，均为确定性操作。
+
+**Observation 未持久化边界**：ObservationInbox 是进程内存结构。尚未持久化的观测不属于已提交事件日志，进程退出即丢失，Replay 不恢复、也不声称能恢复崩溃前未提交的传感器观测，绝不自动制造虚假历史 Observation。
+
+**停机时间规则**：恢复只还原最后一个已持久化事件所代表的状态，停机期间不模拟任何身体恢复、情绪变化或记忆变化。`lastEventTimestamp` 来自真实末事件；`tickSession.lastTickTime` 在恢复后显式重置为本次启动时间并注明边界（不把 `Date.now()` 伪装成历史事件时间），新 Tick 从本次运行的时间基准开始。停机补偿属于后续独立设计。
+
+**恢复状态完整性**：MarrowState 全部字段（含 traits、associations、episodicBuffer、睡眠冻结值等）均由事件流推导，属于 A 类可恢复状态；`lastTickTime` / `tickCount` / Inbox / 等待队列为 B 类进程临时状态，恢复后按新运行重建；未确认观测为 C 类不可恢复状态。恢复后有确定性不变量校验（量程、特质系数 0.5–2.0、uptime 非负等）。
+
+**identity 所有权**：启动时通过 `pg_try_advisory_lock(hashtext('marrow.identity.ownership'), hashtext(identityId))` 双参数命名空间获取会话级锁（与 appendEvents 的单参数写入锁不同键，避免自我死锁），持有专用连接直至关闭；防止两个进程实例同时以同一 identity 运行。
+
+测试：src/__tests__/recovery.pg.test.ts，22 项真实 PostgreSQL 用例覆盖规格 26 项场景（确定性 6、启动恢复 5、事务边界 5、历史版本 4、故障完整性 6）+ identity 所有权锁 1 项。
+
 ---
 
 ## 5. 技术栈
@@ -688,7 +724,11 @@ V2 全新初始化：
 
 - [x] M0：确定性回放与观察—评价管道（ObservationEvent / AppraisalEvent、确定性伪随机、单元测试）
 - [x] M1.1：PostgreSQL 基础设施（docker-compose、events 表、迁移版本管理、连接模块）
-- [ ] M1.2：EventStore 迁移（异步写入、哈希链、并发安全、幂等、回放适配）
+- [x] M1.2：EventStore 迁移（异步写入、哈希链、并发安全、幂等、回放适配）
+  - [x] M1.2.1：PostgreSQL EventStore 基础迁移
+  - [x] M1.2.2：事件链可靠性加固（批量原子提交、观测确认、版本化哈希、RuntimeSession、优雅关闭）
+  - [x] M1.2.3：独立只读哈希链验证器
+  - [x] M1.2.4：确定性 Replay 与重启恢复（见 4.6）
 - [ ] M1.3：V2 Fresh Start 初始化（全新 identity_id、空记忆与关联网络、genesis 事件、幂等初始化）
 - [ ] M1.4：V2 全新运行验收（实时状态与重启回放一致）
 

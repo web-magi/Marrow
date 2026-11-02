@@ -179,6 +179,21 @@ export interface DialogueEvent extends BaseEvent {
 }
 
 /**
+ * ObservationEvent.payload.source 取值集合（单一来源定义）
+ *
+ * 合法值目前只有 'user_text'：Chat 产生的 LLM 观察提取结果。
+ * Tick 读取的传感器物理观测（battery / motion / environment）走
+ * EnvironmentEvent，不走 ObservationEvent。
+ *
+ * 统一入口：events.ts 写端 payload.source 类型与 recovery.ts 恢复端
+ * 校验都必须引用这里，避免两个地方各自硬编码同一组值导致漂移。
+ * 未来若扩展只需在此处扩充 VALID_OBSERVATION_SOURCES，写端与恢复端
+ * 自动同步。
+ */
+export type ObservationSource = 'user_text';
+export const VALID_OBSERVATION_SOURCES: readonly string[] = ['user_text'];
+
+/**
  * ObservationEvent —— 观察事件（阶段四收尾）
  *
  * LLM 对用户输入的"纯观察"结果：
@@ -191,8 +206,8 @@ export interface DialogueEvent extends BaseEvent {
 export interface ObservationEvent extends BaseEvent {
   type: 'observation';
   payload: {
-    /** 观察来源（目前仅支持用户文本） */
-    source: 'user_text';
+    /** 观察来源（合法值集合见上方 VALID_OBSERVATION_SOURCES） */
+    source: ObservationSource;
     /** 被观察的原始文本内容 */
     content: string;
     /** 提取的客观行为类型（可能为 undefined，表示未能识别） */

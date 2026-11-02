@@ -29,7 +29,7 @@
  *   lastTickTime=启动时刻 是本阶段有意为之的语义，不是缺陷。
  */
 import type postgres from 'postgres';
-import type { EventType } from './events.js';
+import { VALID_OBSERVATION_SOURCES, type EventType } from './events.js';
 import { applyEvent, createInitialState, type MarrowState } from './state.js';
 import {
   ENGINE_VERSION,
@@ -330,8 +330,17 @@ function validateRowForReplay(row: PersistedEventRow): ReplayError | null {
       return null;
 
     case 'observation':
-      if (payload.source !== 'user_text' || typeof payload.content !== 'string') {
-        return fail('invalid_payload', 'observation 缺少 source/content');
+      // source 合法性校验必须与 events.ts 的 VALID_OBSERVATION_SOURCES 保持同源——
+      // 不允许 recovery 放宽为任意字符串，恢复层严格 fail-closed
+      if (
+        typeof payload.source !== 'string' ||
+        !VALID_OBSERVATION_SOURCES.includes(payload.source) ||
+        typeof payload.content !== 'string'
+      ) {
+        return fail(
+          'invalid_payload',
+          `observation.source="${String(payload.source)}" 不在合法集合 ${JSON.stringify(VALID_OBSERVATION_SOURCES)} 内，或缺少 content`,
+        );
       }
       if (!isFiniteNumber(payload.confidence) || !isFiniteNumber(payload.uncertainty)) {
         return fail('invalid_payload', 'observation 缺少 confidence/uncertainty');

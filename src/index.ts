@@ -15,10 +15,11 @@
 import { createServer } from 'node:http';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { createInitialState, applyEvent, evokeMemoryFromText, type MarrowState } from './state.js';
+import { applyEvent, evokeMemoryFromText, type MarrowState } from './state.js';
 import { appendEvents, IDENTITY_ID, generateEventId } from './storage.js';
 import {
   acquireIdentityOwnership,
+  freshStartIdentity,
   recoverIdentityOrThrow,
   releaseIdentityOwnership,
 } from './recovery.js';
@@ -954,10 +955,21 @@ async function main(): Promise<void> {
   let state: MarrowState;
 
   if (recovery.verdict === 'empty') {
-    // 空事件链是合法的新身份：使用正式定义的 V2 初始状态，
-    // 不读取 V1 JSONL、不继承任何其他身份的状态
-    console.log('No existing events. Starting fresh (genesis, V2 初始状态).\n');
-    state = createInitialState(new Date().toISOString());
+    // M1.3 Fresh Start：空 identity 必须在 ownership 锁内调用 freshStartIdentity()
+    // 写入 GenesisEvent（首事件锚点）并完成 verify→append→verify→recover→compare 全链路闭环。
+    // 不得在此分支直接 createInitialState() 绕过 Genesis——那会导致生产 identity
+    // 永远没有首事件锚点，verifyEventChain 报 genesis_missing，每次重启循环 empty。
+    //
+    // ownership 锁已在 L951 获取并持续持有至 shutdown（L1110 release），
+    // freshStartIdentity 内部还会二次 verifyEventChain 作为前置防御，
+    // 确保同一 identity 不会被两个进程同时初始化。
+    console.log('No existing events. Running Fresh Start → genesis anchor point.\n');
+    const fresh = await freshStartIdentity(IDENTITY_ID);
+    state = fresh.finalState!;
+    console.log(
+      `Fresh Start complete: genesis (sequence ${fresh.firstSequence}) written, ` +
+        `Replay verified, state recovered.\n`,
+    );
   } else {
     state = recovery.finalState!;
     console.log(

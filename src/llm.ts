@@ -165,11 +165,15 @@ export interface LLMClient {
    * 基于状态快照和用户输入生成候选回复
    * @param snapshot 当前状态快照
    * @param userInput 用户输入文本
+   * @param signal 取消信号（C3）：Chat admission 超时/移除/会话关闭时触发，
+   *   触发后尝试取消底层请求；即使模型不支持取消，迟到结果也会
+   *   被 RuntimeSession.markReady 丢弃，绝不提交事件或发布状态
    * @returns 候选行为
    */
   generateResponse(
     snapshot: StateSnapshot,
     userInput: string,
+    signal?: AbortSignal,
   ): Promise<CandidateBehavior>;
 }
 
@@ -451,6 +455,7 @@ class RealLLMClient implements LLMClient {
   async generateResponse(
     snapshot: StateSnapshot,
     userInput: string,
+    signal?: AbortSignal,
   ): Promise<CandidateBehavior> {
     // 维度快照注入到 System Prompt（而非 user prompt），
     // 确保它作为"风格指导"区域存在，不被对话内容稀释。
@@ -498,7 +503,11 @@ class RealLLMClient implements LLMClient {
         temperature: 0.8,
         max_tokens: 200,
       }),
-      signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
+      // C3：调用方取消信号（admission 超时/移除/关闭）与内置超时合并，
+      // 任一触发即中止底层请求；已中止的信号会立即中止合并信号
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(LLM_TIMEOUT_MS)])
+        : AbortSignal.timeout(LLM_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -735,10 +744,13 @@ export function createLLMClient(): LLMClient {
     const real = new RealLLMClient(config);
     const mock = new MockLLMClient();
     return {
-      async generateResponse(snapshot, userInput) {
+      async generateResponse(snapshot, userInput, signal) {
         try {
-          return await real.generateResponse(snapshot, userInput);
+          return await real.generateResponse(snapshot, userInput, signal);
         } catch (err) {
+          // 调用方主动取消（等待超时/会话关闭）不属于模型故障：
+          // 不降级 mock，直接上抛，避免迟到结果覆盖明确的取消语义
+          if (signal?.aborted) throw err;
           const msg = err instanceof Error ? err.message : String(err);
           console.warn(`[LLM] Real client failed (${msg}), falling back to mock`);
           return mock.generateResponse(snapshot, userInput);

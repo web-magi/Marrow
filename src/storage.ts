@@ -58,26 +58,130 @@ export const ENGINE_VERSION = readEngineVersion();
  * 规范化 JSON 序列化（canonical JSON）。
  *
  * 规则（全链路固定，哈希链与幂等比较的唯一依据）：
- * - 对象：key 按 UTF-16 字典序排序；值为 undefined 的键剔除（匹配 JSONB 语义）；
+ * - 纯对象：key 按 UTF-16 字典序排序；值为 undefined 的键剔除（匹配 JSONB 语义）；
  *   嵌套对象递归应用
- * - 数组：保持原有顺序
+ * - 数组：保持原有顺序；元素为 undefined 时按 JSON 语义转为 null
+ *   （与 JSON.stringify / JSONB 落库结果保持一致，不能产出 `[,]` 这种非法形式）
  * - 原始类型：JSON.stringify 语义
+ * - 非纯对象（Date/Buffer 等）：走 JSON.stringify 的 toJSON 语义，
+ *   不能按"无键对象"退化成 `{}`
  */
 export function canonicalize(value: unknown): string {
-  if (value === null || typeof value !== 'object') {
-    return JSON.stringify(value);
-  }
   if (Array.isArray(value)) {
-    return `[${value.map((item) => canonicalize(item)).join(',')}]`;
+    return `[${value
+      .map((item) => (item === undefined ? 'null' : canonicalize(item)))
+      .join(',')}]`;
   }
-  const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj)
-    .filter((k) => obj[k] !== undefined)
-    .sort();
-  const parts = keys.map(
-    (k) => `${JSON.stringify(k)}:${canonicalize(obj[k])}`,
-  );
-  return `{${parts.join(',')}}`;
+
+  if (value !== null && typeof value === 'object') {
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) {
+      // 非纯对象：交给 JSON.stringify（会调用 toJSON）
+      const serialized = JSON.stringify(value) as string | undefined;
+      if (serialized === undefined) {
+        throw new TypeError(
+          `canonicalize: 无法序列化的非纯对象 ${Object.prototype.toString.call(value)}`,
+        );
+      }
+      return serialized;
+    }
+
+    const obj = value as Record<string, unknown>;
+    const keys = Object.keys(obj)
+      .filter((k) => obj[k] !== undefined)
+      .sort();
+    const parts = keys.map(
+      (k) => `${JSON.stringify(k)}:${canonicalize(obj[k])}`,
+    );
+    return `{${parts.join(',')}}`;
+  }
+
+  const serialized = JSON.stringify(value) as string | undefined;
+  if (serialized === undefined) {
+    // 顶层 undefined / function / symbol 无法进入 JSON / JSONB
+    throw new TypeError(
+      `canonicalize: 顶层值不可序列化（typeof=${typeof value}）`,
+    );
+  }
+  return serialized;
+}
+
+/**
+ * 校验事件载荷能否无损往返 JSON / JSONB。
+ *
+ * 明确拒绝会被 JSONB 静默改变语义的输入，而不是让它们悄悄变成别的值：
+ * - NaN / Infinity → JSON.stringify 会写成 null
+ * - BigInt / function / symbol → 无法序列化
+ * - 数组元素为 undefined → 会变成 null（语义改变）
+ * - 非纯对象（Date/Map/Buffer 等）→ 落库后类型信息丢失
+ * - 循环引用 → 无法序列化
+ *
+ * 对象属性值为 undefined 是合法的：会被 JSON.stringify / JSONB 剔除，
+ * canonicalize 也按相同规则剔除，二者语义一致。
+ *
+ * @throws TypeError 载荷触碰上述边界时抛出，appendEvent 在写库前直接失败
+ */
+export function assertJsonSafe(value: unknown, path = '$'): void {
+  if (value === null) return;
+
+  switch (typeof value) {
+    case 'string':
+      if (value.includes('\u0000')) {
+        throw new TypeError(
+          `payload${path}: 字符串包含 U+0000，PostgreSQL JSONB 无法存储`,
+        );
+      }
+      return;
+    case 'boolean':
+      return;
+    case 'number':
+      if (!Number.isFinite(value)) {
+        throw new TypeError(
+          `payload${path}: 非有限数值（NaN/Infinity）无法无损写入 JSONB`,
+        );
+      }
+      // -0 不拒绝：JSON.stringify 与 JSONB 都会把它规范化为 0，
+      // canonicalize 也输出 "0"，哈希与落库结果一致；数值计算上 -0 与 0 等价。
+      return;
+    case 'undefined':
+      throw new TypeError(`payload${path}: undefined 无法写入 JSONB`);
+    case 'bigint':
+    case 'function':
+    case 'symbol':
+      throw new TypeError(`payload${path}: ${typeof value} 无法写入 JSONB`);
+    case 'object':
+      break;
+  }
+
+  const obj = value as object;
+
+  if (Array.isArray(obj)) {
+    for (let i = 0; i < obj.length; i++) {
+      const item = (obj as unknown[])[i];
+      if (item === undefined) {
+        throw new TypeError(
+          `payload${path}[${i}]: 数组元素为 undefined，JSONB 会写成 null`,
+        );
+      }
+      assertJsonSafe(item, `${path}[${i}]`);
+    }
+    return;
+  }
+
+  const proto = Object.getPrototypeOf(obj);
+  if (proto !== Object.prototype && proto !== null) {
+    throw new TypeError(
+      `payload${path}: 非纯对象 ${Object.prototype.toString.call(obj)} 无法无损写入 JSONB`,
+    );
+  }
+
+  const record = obj as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    const item = record[key];
+    // 对象属性 undefined：JSON.stringify / JSONB 会剔除该键，canonicalize 同规则
+    if (item === undefined) continue;
+    assertJsonSafe(item, `${path}.${key}`);
+  }
 }
 
 /**
@@ -87,18 +191,31 @@ export function canonicalize(value: unknown): string {
  *   identity_id / schema_version / engine_version /
  *   causation_id / correlation_id / previous_event_hash / event
  * 不包含 event_hash 自身与 sequence（后者由数据库分配）。
+ *
+ * 版本显式传入（D 阶段）：
+ * - 函数内部禁止读取全局 SCHEMA_VERSION / ENGINE_VERSION
+ * - 新写入时调用方传当前全局版本
+ * - 历史事件验证时调用方必须传数据库行自身的版本，
+ *   否则用今天的版本去重算旧哈希必然不匹配
+ *
+ * engineVersion 允许为 null：数据库列可为 NULL，
+ * 历史行按其原值参与规范化，不做兜底替换（否则会改变旧哈希语义）。
  */
-export function computeEventHash(params: {
+export interface ComputeEventHashParams {
   identityId: string;
+  schemaVersion: number;
+  engineVersion: string | null;
   causationId: string | null;
   correlationId: string | null;
   previousEventHash: string | null;
   event: MarrowEvent;
-}): string {
+}
+
+export function computeEventHash(params: ComputeEventHashParams): string {
   const canonical = canonicalize({
     identity_id: params.identityId,
-    schema_version: SCHEMA_VERSION,
-    engine_version: ENGINE_VERSION,
+    schema_version: params.schemaVersion,
+    engine_version: params.engineVersion,
     causation_id: params.causationId,
     correlation_id: params.correlationId,
     previous_event_hash: params.previousEventHash,
@@ -118,87 +235,165 @@ export interface AppendEventOptions {
 }
 
 /**
- * 追加一个事件到 PostgreSQL 事件流。
+ * 批量追加事件到 PostgreSQL 事件流（M1.2.2.1）。
  *
- * 流程（单事务内完成，保证并发下哈希链顺序与提交顺序一致）：
- * 1. 事务级 advisory lock（按 identity 哈希）—— 同一身份的写入串行化
- * 2. 读取链尾事件哈希（genesis 为 NULL）
- * 3. 计算本事件哈希并插入
- * 4. event_id 冲突时：比较已有 payload 与新事件的规范化序列化结果——
- *    相同视为幂等重试成功；不同说明 event_id 碰撞，抛错。
- *    （注意：不能比较 event_hash——同一事件在链增长后重试时
- *      previous_event_hash 已变化，hash 必然不同；幂等语义应针对事件内容本身。）
+ * 整批事件在**同一个事务**中写入：
+ * 1. 事务开始时只获取一次 pg_advisory_xact_lock(hashtext(identity))——
+ *    锁持有到事务提交，其他同 identity 的写入无法插入到这批事件中间
+ * 2. 只读取一次链尾（genesis 为 NULL）
+ * 3. 按数组顺序逐条计算 previous_event_hash / event_hash 并插入，
+ *    形成一条连续的哈希链
+ * 4. 任意一条插入失败 → 整个事务回滚：本批新增 0 条，链尾不变
+ * 5. 只有全部成功才提交
  *
- * @throws 数据库不可用、event_id 碰撞（内容不一致）时抛错，绝不静默回退
+ * 幂等（与单条写入规则一致）：event_id 冲突时比较不可变事件内容 + 元数据
+ * （identity_id / event_type / timestamp / payload / causation_id /
+ * correlation_id / schema_version / engine_version），全部一致才视为重试成功。
+ * 注意：重试命中已存在事件时**不推进批内 previousHash**——
+ * 该事件已在链的旧位置，后续新事件必须挂在当前链尾之后，不能错误地接在旧事件后面。
+ *
+ * @throws 数据库不可用、载荷触碰 JSONB 边界、任一条 event_id 碰撞时抛错，
+ *   抛出时整批回滚，绝不静默回退到 JSONL
  */
-export async function appendEvent(
-  event: MarrowEvent,
+export async function appendEvents(
+  events: MarrowEvent[],
   opts: AppendEventOptions = {},
 ): Promise<void> {
+  if (events.length === 0) return;
+
+  // 写库前先对整批做 JSONB 无损校验：NaN/Infinity/BigInt/非纯对象等会被
+  // JSON.stringify 或 PostgreSQL 静默改写，必须在边界处明确拒绝。
+  for (const event of events) {
+    assertJsonSafe(event);
+  }
+
   const sql = getDb();
   const identityId = opts.identityId ?? IDENTITY_ID;
   const causationId = opts.causationId ?? null;
   const correlationId = opts.correlationId ?? null;
 
   await sql.begin(async (tx) => {
-    // 1. 事务级 advisory lock：串行化同一身份的写入，
-    //    保证哈希链读取-写入的原子性，不依赖 BIGSERIAL 分配顺序
+    // 1. 事务级 advisory lock：整批只加一次锁，持有到 COMMIT/ROLLBACK
     await tx`SELECT pg_advisory_xact_lock(hashtext(${identityId}))`;
 
-    // 2. 读链尾（genesis 事件 previous_event_hash 为 NULL）
+    // 2. 读一次链尾（genesis 事件 previous_event_hash 为 NULL）
     const tail = await tx<{ event_hash: string }[]>`
       SELECT event_hash FROM events
       WHERE identity_id = ${identityId}
       ORDER BY sequence DESC
       LIMIT 1
     `;
-    const previousHash = tail.length > 0 ? tail[0]!.event_hash : null;
+    let previousHash = tail.length > 0 ? tail[0]!.event_hash : null;
 
-    // 3. 计算哈希并插入
-    const eventHash = computeEventHash({
-      identityId,
-      causationId,
-      correlationId,
-      previousEventHash: previousHash,
-      event,
-    });
+    // 3. 按批次顺序写入，链顺序 == sequence 顺序
+    for (const event of events) {
+      const eventHash = computeEventHash({
+        identityId,
+        // 新写入事件固定使用当前版本
+        schemaVersion: SCHEMA_VERSION,
+        engineVersion: ENGINE_VERSION,
+        causationId,
+        correlationId,
+        previousEventHash: previousHash,
+        event,
+      });
 
-    // 内联行对象（postgres.js 类型推断要求 payload 为 sql.json 参数类型）
-    const inserted = await tx<{ event_hash: string }[]>`
-      INSERT INTO events ${tx({
-        event_id: event.id,
-        identity_id: identityId,
-        timestamp: event.timestamp,
-        event_type: event.type,
-        schema_version: SCHEMA_VERSION,
-        engine_version: ENGINE_VERSION,
-        causation_id: causationId,
-        correlation_id: correlationId,
-        previous_event_hash: previousHash,
-        event_hash: eventHash,
-        payload: sql.json(event as unknown as Record<string, unknown>),
-      })}
-      ON CONFLICT (event_id) DO NOTHING
-      RETURNING event_hash
-    `;
+      // 内联行对象（postgres.js 类型推断要求 payload 为 sql.json 参数类型）
+      const inserted = await tx<{ event_hash: string }[]>`
+        INSERT INTO events ${tx({
+          event_id: event.id,
+          identity_id: identityId,
+          timestamp: event.timestamp,
+          event_type: event.type,
+          schema_version: SCHEMA_VERSION,
+          engine_version: ENGINE_VERSION,
+          causation_id: causationId,
+          correlation_id: correlationId,
+          previous_event_hash: previousHash,
+          event_hash: eventHash,
+          payload: sql.json(event as unknown as Record<string, unknown>),
+        })}
+        ON CONFLICT (event_id) DO NOTHING
+        RETURNING event_hash
+      `;
 
-    if (inserted.length > 0) return; // 正常插入
+      if (inserted.length > 0) {
+        previousHash = eventHash; // 链尾前移
+        continue;
+      }
 
-    // 4. 冲突路径：幂等语义 = 事件内容一致
-    const existing = await tx<{ payload: unknown }[]>`
-      SELECT payload FROM events WHERE event_id = ${event.id}
-    `;
-    if (existing.length === 0) {
-      // 理论上不可达（ON CONFLICT 未插入却查不到），防御性抛错
-      throw new Error(`event_id 冲突但查询不到已有记录: ${event.id}`);
+      // 4. 冲突路径：幂等语义 = 不可变事件内容 + 元数据全部一致
+      //
+      //    只比较 payload 不够：跨身份复用同一 event_id 会被静默吞掉；
+      //    timestamp / causation_id / correlation_id / 版本等元数据差异也必须拒绝。
+      //    timestamp 用 SQL 侧相等比较，避免 JS Date 只保留毫秒精度造成误判。
+      const existing = await tx<
+        {
+          identity_id: string;
+          event_type: string;
+          timestamp_equal: boolean;
+          payload: unknown;
+          causation_id: string | null;
+          correlation_id: string | null;
+          schema_version: number;
+          engine_version: string | null;
+        }[]
+      >`
+        SELECT
+          identity_id,
+          event_type,
+          ("timestamp" = ${event.timestamp}::timestamptz) AS timestamp_equal,
+          payload,
+          causation_id,
+          correlation_id,
+          schema_version,
+          engine_version
+        FROM events
+        WHERE event_id = ${event.id}
+      `;
+      if (existing.length === 0) {
+        // 理论上不可达（ON CONFLICT 未插入却查不到），防御性抛错
+        throw new Error(`event_id 冲突但查询不到已有记录: ${event.id}`);
+      }
+
+      const row = existing[0]!;
+      const mismatches: string[] = [];
+      if (row.identity_id !== identityId) mismatches.push('identity_id');
+      if (row.event_type !== event.type) mismatches.push('event_type');
+      if (row.timestamp_equal !== true) mismatches.push('timestamp');
+      if (canonicalize(row.payload) !== canonicalize(event)) {
+        mismatches.push('payload');
+      }
+      if (row.causation_id !== causationId) mismatches.push('causation_id');
+      if (row.correlation_id !== correlationId) mismatches.push('correlation_id');
+      if (row.schema_version !== SCHEMA_VERSION) mismatches.push('schema_version');
+      if (row.engine_version !== ENGINE_VERSION) mismatches.push('engine_version');
+
+      if (mismatches.length > 0) {
+        throw new Error(
+          `event_id 碰撞：${event.id} 已存在且不可变内容不一致` +
+            `（字段: ${mismatches.join(', ')}），拒绝覆盖`,
+        );
+      }
+      // 全部一致：幂等重试，数据库原记录保持不变；
+      // 关键：不推进 previousHash（该事件在链的旧位置，不是本批的链尾）
     }
-    if (canonicalize(existing[0]!.payload) !== canonicalize(event)) {
-      throw new Error(
-        `event_id 碰撞：${event.id} 已存在且内容不一致，拒绝覆盖`,
-      );
-    }
-    // 内容一致：幂等重试，视为成功
   });
+}
+
+/**
+ * 追加单个事件（原有接口保留）。
+ *
+ * 内部复用 appendEvents 的同一事务语义，避免无关调用方发生变更。
+ *
+ * @throws 数据库不可用、载荷触碰 JSONB 边界、event_id 碰撞（内容不一致）时抛错，
+ *   绝不静默回退到 JSONL
+ */
+export async function appendEvent(
+  event: MarrowEvent,
+  opts: AppendEventOptions = {},
+): Promise<void> {
+  await appendEvents([event], opts);
 }
 
 /**

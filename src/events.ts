@@ -67,6 +67,12 @@ export interface InterruptionEvent extends BaseEvent {
     arousalAtInterruption: number;
     /** 中断时正在执行的行为 */
     lastBehavior: string;
+    /**
+     * 物理观测发生时间（ISO 8601）。
+     * 与事件日志时间 event.timestamp 分离：前者是传感器读数时刻，
+     * 后者是事件首次构建时冻结的时间。历史事件可能缺失。
+     */
+    observedAt?: string;
     /** 中断时长（秒），重启时填入 */
     interruptionDurationSeconds?: number;
     /**
@@ -94,6 +100,11 @@ export interface EnvironmentEvent extends BaseEvent {
     moodDelta: number;
     /** 显著性（0-1，越高越难被遗忘） */
     salience: number;
+    /**
+     * 物理观测发生时间（ISO 8601）。
+     * 与 event.timestamp 分离；历史事件可能缺失。
+     */
+    observedAt?: string;
   };
 }
 

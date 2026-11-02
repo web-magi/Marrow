@@ -16,13 +16,22 @@ import { createServer } from 'node:http';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInitialState, applyEvent, evokeMemoryFromText, type MarrowState } from './state.js';
-import {
-  type TickEvent,
-  type EnvironmentEvent,
-  type InterruptionEvent,
-} from './events.js';
 import { replay } from './replay.js';
-import { appendEvent, loadEvents, generateEventId } from './storage.js';
+import { appendEvent, IDENTITY_ID, loadEvents, generateEventId } from './storage.js';
+import { executeTick, type TickSession } from './tick.js';
+import {
+  assertObservationBarrier,
+  InMemoryObservationInbox,
+  ObservationBarrierError,
+} from './observation.js';
+import {
+  ChatAdmissionRemovedError,
+  ChatWaitTimeoutError,
+  getRuntimeSession,
+  RuntimeQueueFullError,
+  RuntimeSessionClosedError,
+  type ChatAdmission,
+} from './runtime-session.js';
 import { closeDb } from './db/connection.js';
 import {
   createSimulatedSensors,
@@ -41,7 +50,6 @@ import { appraise, type AppraisalContext } from './appraisal.js';
 import { filterCandidateBehavior } from './dialogue.js';
 import type {
   DialogueEvent,
-  SleepEvent,
   ObservationEvent,
   AppraisalEvent,
 } from './events.js';
@@ -110,6 +118,37 @@ let currentState: MarrowState | null = null;
 /** 状态历史缓冲区 */
 const stateHistory: MarrowState[] = [];
 
+/**
+ * 传感器观测收件箱（M1.2.2.2-A 单进程过渡实现）
+ *
+ * 与 Tick、Chat 屏障共用同一实例：Tick 读取后未确认的观测会阻止 Chat 提交，
+ * 避免对话事件越过待恢复观测导致事件日志时间倒退。
+ * 进程重启会丢失未确认观测；跨进程可靠性留给未来的持久化 Inbox。
+ */
+const observationInbox = new InMemoryObservationInbox();
+
+/**
+ * Chat 等待超时（毫秒）
+ *
+ * M1.2.2-C1：从 reserveChat() 开始计时，覆盖 extracting/ready/waiting 阶段；
+ * 超时后 admission 被物理移出队列并释放容量。
+ */
+const CHAT_WAIT_TIMEOUT_MS = Math.max(
+  1,
+  parseInt(process.env.CHAT_WAIT_TIMEOUT_MS ?? '30000', 10),
+);
+
+/**
+ * 单 identity RuntimeSession（M1.2.2-C，已完成 C1/C2/C3）
+ *
+ * Chat 与 Tick 的所有状态变更、事件持久化与内存状态发布都在其单执行器内
+ * 串行执行；A 阶段的 identity-lock 临时机制已被完全取代并移除（C3）。
+ * 优雅关闭时通过 runtimeSession.shutdown() 排空队列并等待执行中任务完成。
+ */
+const runtimeSession = getRuntimeSession(IDENTITY_ID, {
+  chatWaitTimeoutMs: CHAT_WAIT_TIMEOUT_MS,
+});
+
 /** 对话历史缓冲区（用于监控页面展示） */
 interface DialogueMessage {
   direction: 'user_input' | 'companion_output';
@@ -140,18 +179,6 @@ function formatState(state: MarrowState): string {
     `uptime=${uptime}s interruptions=${interruptions} ` +
     `behavior=${behavior}(${reason})`
   );
-}
-
-/**
- * 创建一个 tick 事件
- */
-function createTickEvent(deltaSeconds: number): TickEvent {
-  return {
-    type: 'tick',
-    id: generateEventId(),
-    timestamp: new Date().toISOString(),
-    payload: { deltaSeconds },
-  };
 }
 
 /**
@@ -202,41 +229,77 @@ async function handleChatRequest(
     return;
   }
 
-  const state = currentState;
-  const timestamp = new Date().toISOString();
+  // C1：先占用 admission 容量（同步），第 33 个请求在 LLM 提取前被拒绝
+  let admission: ChatAdmission;
+  try {
+    admission = runtimeSession.reserveChat();
+  } catch (err) {
+    if (err instanceof RuntimeQueueFullError) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'chat queue full', code: err.code }));
+      return;
+    }
+    if (err instanceof RuntimeSessionClosedError) {
+      // C3：会话正在关闭，不再接受新任务
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'session closing', code: err.code }));
+      return;
+    }
+    throw err;
+  }
 
-  // 1. 调用 LLM：提取客观事实 + 生成回复文本
-  //    LLM 只做意图提取和文本渲染，不计算情绪效价
-  const snapshot = buildStateSnapshot(state);
-  const fallbackExtraction: ExtractionResult = {
-    action: 'unknown',
-    intensity: 0.3,
-    confidence: 0.2,
-    facts: [],
-    uncertainty: 0.8,
-  };
+  const state = currentState;
   let candidate: {
     text: string;
     action: import('./events.js').DialogueAction;
     intensity: number;
     extraction: ExtractionResult;
   };
+
+  // 1. 调用 LLM：提取客观事实 + 生成回复文本
+  //    LLM 只做意图提取和文本渲染，不计算情绪效价；
+  //    extracting 计入容量但不占用执行器。
+  //    C3：传入 admission.signal——等待超时/释放/关闭会取消底层请求；
+  //    即使模型不支持取消，迟到结果也会被 markReady 丢弃。
   try {
-    candidate = await llmClient.generateResponse(snapshot, userInput);
+    const snapshot = buildStateSnapshot(state);
+    candidate = await llmClient.generateResponse(snapshot, userInput, admission.signal);
   } catch (err) {
+    if (admission.signal.aborted) {
+      // admission 已因等待超时/关闭被移除：容量已释放，结果不会进入执行器
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'chat removed', code: 'chat_removed' }));
+      return;
+    }
     console.error('[LLM] generateResponse failed:', err);
-    candidate = {
-      text: '...（暂时无法回应）',
-      action: 'unknown',
-      intensity: 0.3,
-      extraction: fallbackExtraction,
-    };
+    // 提取失败：释放容量，绝不进入执行器
+    runtimeSession.release(admission, 'extraction failed');
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({ error: 'extraction failed', code: 'chat_extraction_failed' }),
+    );
+    return;
   }
 
-  // 事件持久化段：写库失败必须中止本次请求（返回 500），绝不静默回退。
-  // 写前一致性：appendEvent 成功后才 applyEvent，保证内存状态始终是
-  // 已持久化事件流回放结果的一致前缀。
-  try {
+  // C1：把状态变更、持久化、内存状态发布作为单一任务交给执行器串行执行。
+  // 事件时间戳在任务真正执行时生成，避免排队等待期间使用过期时间。
+  runtimeSession.markReady(admission, async () => {
+      // 观测恢复屏障：存在未确认观测时拒绝提交，绝不越过 pending 观测
+      await assertObservationBarrier(observationInbox);
+      const state = currentState;
+      if (!state) throw new Error('system not ready');
+
+      // C2：同一 Chat 任务内事件时间戳必须单调递增。
+      // 事件逐条写库时后一条不能早于前一条，否则事件日志时间轴倒退；
+      // 与 Tick 的互斥由 RuntimeSession 单执行器保证。
+      let lastTimestamp = '';
+      const stamp = (): string => {
+        const now = new Date().toISOString();
+        if (now > lastTimestamp) lastTimestamp = now;
+        return lastTimestamp;
+      };
+      const timestamp = stamp();
+
     // 2. 写观察事件（纯事实记录，不驱动状态变化）
     const observationEvent: ObservationEvent = {
       type: 'observation',
@@ -281,7 +344,7 @@ async function handleChatRequest(
     const appraisalEvent: AppraisalEvent = {
       type: 'appraisal',
       id: generateEventId(),
-      timestamp: new Date().toISOString(),
+      timestamp: stamp(),
       payload: {
         sourceObservationId: observationEvent.id,
         valenceDelta: appraisalResult.valenceDelta,
@@ -300,7 +363,8 @@ async function handleChatRequest(
     const userEvent: DialogueEvent = {
       type: 'dialogue',
       id: generateEventId(),
-      timestamp,
+      // 写在评价事件之后，时间戳必须不小于评价事件，避免日志时间倒退
+      timestamp: stamp(),
       payload: {
         direction: 'user_input',
         text: userInput,
@@ -325,7 +389,7 @@ async function handleChatRequest(
     const companionEvent: DialogueEvent = {
       type: 'dialogue',
       id: generateEventId(),
-      timestamp: new Date().toISOString(),
+      timestamp: stamp(),
       payload: {
         direction: 'companion_output',
         text: filterResult.text,
@@ -371,15 +435,39 @@ async function handleChatRequest(
       console.log(`[CHAT] user: "${userInput.slice(0, 30)}" → companion: "${filterResult.text.slice(0, 30)}"`);
     }
 
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(
-      JSON.stringify({
+      return {
         reply: filterResult.text,
         filtered: filterResult.filtered,
         filterReason: filterResult.filterReason || null,
-      }),
-    );
+      };
+  });
+
+  // 提取完成时若 admission 已被超时移除，markReady 会丢弃任务；
+  // 最终结果统一由 completion 给出（成功或明确异常）。
+  try {
+    const outcome = await admission.completion;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(outcome));
   } catch (err) {
+    if (err instanceof ObservationBarrierError) {
+      // 观测恢复屏障：存在未确认观测，拒绝提交本次对话事件，
+      // 避免 Chat 越过 pending 观测造成事件日志时间倒退。
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({ error: 'observations pending', code: err.code }),
+      );
+      return;
+    }
+    if (err instanceof ChatWaitTimeoutError) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'chat wait timeout', code: err.code }));
+      return;
+    }
+    if (err instanceof ChatAdmissionRemovedError) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'chat removed', code: err.code }));
+      return;
+    }
     // 写库失败：中止本次请求，不更新全局状态，绝不静默回退
     console.error('[EventStore] 对话事件写入失败，中止本次请求:', err);
     res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -876,211 +964,126 @@ async function main(): Promise<void> {
   // 启动监控服务器
   startMonitorServer(sensors);
 
-  let lastTickTime = Date.now();
-  let tickCount = 0;
+  // tick 会话：state / lastTickTime / tickCount 只有在批量事务提交成功后才推进
+  const tickSession: TickSession = {
+    state,
+    lastTickTime: Date.now(),
+    tickCount: 0,
+  };
 
-  // tick 重入保护：上一次 tick 的写库尚未完成时跳过本次触发
-  let tickInFlight = false;
+  /**
+   * 请求一轮 Tick（M1.2.2-C2）
+   *
+   * Tick 与 Chat 统一进入 RuntimeSession 的单执行器：
+   * - 读取传感器、构建批次、持久化、确认观测、发布内存状态全部串行执行，
+   *   不会与 Chat 的事件写入交错（A 阶段的双机制空窗已消除）
+   * - 同一时刻最多一个 Tick 排队，重复请求自动合并
+   * - 上一轮 Tick 失败后，下一轮自动升级为 recovery-tick（最高优先级）
+   *
+   * 事件时间戳在任务真正执行时生成；失败时整批回滚，
+   * session.state / lastTickTime / tickCount 保持原样，下一轮自然补偿。
+   */
   const runTick = async (): Promise<void> => {
-    const now = Date.now();
-    const realDelta = (now - lastTickTime) / 1000;
-    lastTickTime = now;
+    await runtimeSession
+      .requestTick(async () => {
+        try {
+          const batch = await executeTick(
+            tickSession,
+            sensors,
+            observationInbox,
+            Date.now(),
+            TIME_SCALE,
+          );
 
-    // 应用时间缩放因子：真实时间 × 缩放 = 模拟时间
-    const totalDeltaSeconds = realDelta * TIME_SCALE;
+          // 事务提交成功：发布内存状态与历史快照
+          state = tickSession.state;
+          currentState = state;
+          for (const snapshot of batch.snapshots) {
+            stateHistory.push(snapshot);
+          }
+          while (stateHistory.length > HISTORY_SIZE) {
+            stateHistory.shift();
+          }
 
-    // 子步进：把大 delta 拆成多个 ≤10 秒的小步
-    // 保证 arousal 指数衰减、mood 随机游走等过程的数值精度
-    const SUB_STEP_SECONDS = 10;
-    const numSubSteps = Math.max(1, Math.ceil(totalDeltaSeconds / SUB_STEP_SECONDS));
-    const subStepDelta = totalDeltaSeconds / numSubSteps;
+          for (const notice of batch.notices) {
+            console.log(notice);
+          }
 
-    for (let i = 0; i < numSubSteps; i++) {
-      const subTickEvent = createTickEvent(subStepDelta);
+          // 每 6 次 tick（约 1 分钟）输出一次状态，避免刷屏
+          if (tickSession.tickCount % 6 === 0) {
+            console.log(formatState(state));
+          }
 
-      // 只把第一个子步写入持久化日志（避免日志膨胀）
-      if (i === 0) {
-        await appendEvent(subTickEvent);
-      }
+          // 每小时输出一次汇总
+          if (tickSession.tickCount % 360 === 0) {
+            const hours = (state.uptimeSeconds / 3600).toFixed(2);
+            console.log(`\n--- ${hours}h checkpoint ---`);
+            console.log(formatState(state));
+            console.log('------------------------\n');
+          }
 
-      state = applyEvent(state, subTickEvent);
-      currentState = state;
-
-      // 每个子步都记录到历史缓冲区，让曲线更平滑
-      stateHistory.push(state);
-      if (stateHistory.length > HISTORY_SIZE) {
-        stateHistory.shift();
-      }
-    }
-
-    tickCount++;
-
-    // === 阶段三：传感器数据接入 ===
-    // 在 tick 子步进之后，读取传感器并生成对应事件
-
-    // 1. 电池电量 → 更新 state.batteryLevel
-    //    电池耗尽时触发休眠中断
-    const battery = sensors.battery.read();
-    const batteryEvent: EnvironmentEvent = {
-      type: 'environment',
-      id: generateEventId(),
-      timestamp: new Date().toISOString(),
-      payload: {
-        feature: 'battery',
-        reading: battery.level,
-        moodDelta: 0,
-        salience: battery.level < 20 ? 0.8 : 0.1,
-      },
-    };
-    await appendEvent(batteryEvent);
-    state = applyEvent(state, batteryEvent);
-    currentState = state;
-    stateHistory.push(state);
-    if (stateHistory.length > HISTORY_SIZE) {
-      stateHistory.shift();
-    }
-
-    // 电池恢复 → 唤醒（结束睡眠/夜间反刍）
-    if (battery.level >= 20 && state.sleeping) {
-      const wakeEvent: SleepEvent = {
-        type: 'sleep',
-        id: generateEventId(),
-        timestamp: new Date().toISOString(),
-        payload: { entering: false, reason: 'battery_recovered' },
-      };
-      await appendEvent(wakeEvent);
-      state = applyEvent(state, wakeEvent);
-      currentState = state;
-      stateHistory.push(state);
-      if (stateHistory.length > HISTORY_SIZE) {
-        stateHistory.shift();
-      }
-      console.log(`[SLEEP] battery recovered, waking up`);
-    }
-
-    // 电池耗尽 → 触发休眠中断（创伤性：断电=被抛弃）
-    if (battery.level < 2 && state.lastBehavior.kind !== 'interrupted') {
-      const sleepInterruption: InterruptionEvent = {
-        type: 'interruption',
-        id: generateEventId(),
-        timestamp: new Date().toISOString(),
-        payload: {
-          reason: `battery_depleted: level ${battery.level.toFixed(1)}%, entering sleep`,
-          energyAtInterruption: state.energy,
-          moodBaselineAtInterruption: state.moodBaseline,
-          arousalAtInterruption: state.arousal,
-          lastBehavior: state.lastBehavior.kind,
-          isTraumatic: true,
-        },
-      };
-      await appendEvent(sleepInterruption);
-      state = applyEvent(state, sleepInterruption);
-
-      // 入睡事件：冻结入睡时的信任度与内耗（供夜间反刍判定）
-      const sleepOnset: SleepEvent = {
-        type: 'sleep',
-        id: generateEventId(),
-        timestamp: new Date().toISOString(),
-        payload: { entering: true, reason: 'battery_depleted' },
-      };
-      await appendEvent(sleepOnset);
-      state = applyEvent(state, sleepOnset);
-
-      currentState = state;
-      stateHistory.push(state);
-      if (stateHistory.length > HISTORY_SIZE) {
-        stateHistory.shift();
-      }
-      console.log(`[INTERRUPTION] battery depleted, entering sleep`);
-    }
-
-    // 2. 运动传感器 → 碰撞触发中断
-    const motion = sensors.motion.read();
-    if (motion.collision) {
-      const collisionInterruption: InterruptionEvent = {
-        type: 'interruption',
-        id: generateEventId(),
-        timestamp: new Date().toISOString(),
-        payload: {
-          reason: `collision: acceleration ${motion.magnitude.toFixed(1)} m/s² exceeded threshold`,
-          energyAtInterruption: state.energy,
-          moodBaselineAtInterruption: state.moodBaseline,
-          arousalAtInterruption: state.arousal,
-          lastBehavior: state.lastBehavior.kind,
-        },
-      };
-      await appendEvent(collisionInterruption);
-      state = applyEvent(state, collisionInterruption);
-      currentState = state;
-      stateHistory.push(state);
-      if (stateHistory.length > HISTORY_SIZE) {
-        stateHistory.shift();
-      }
-      console.log(`[INTERRUPTION] collision detected (${motion.magnitude.toFixed(1)} m/s²)`);
-    }
-
-    // 3. 环境传感器 → 缓慢调制 mood_baseline
-    //    架构要求：温度/湿度/光照以小时级时间常数缓慢调制 mood_baseline 漂移方向
-    //    每 tick moodDelta 控制在 ±0.0125，每小时累积约 ±4.5 点
-    const env = sensors.environment.read();
-    // 舒适温度范围 18-26°C，偏离越大 mood 影响越大
-    const tempComfort = 1 - Math.min(1, Math.abs(env.temperature - 22) / 15);
-    // 光照影响：白天（强光）略正向，夜晚略负向
-    const lightEffect = (env.light - 500) / 1000; // -0.5 ~ 0.5
-    const envMoodDelta = (tempComfort - 0.5) * 2 + lightEffect * 0.5;
-    const envEvent: EnvironmentEvent = {
-      type: 'environment',
-      id: generateEventId(),
-      timestamp: new Date().toISOString(),
-      payload: {
-        feature: 'environment',
-        reading: env.temperature,
-        moodDelta: envMoodDelta * 0.01, // 小时级时间常数，缓慢调制
-        salience: 0.05,
-      },
-    };
-    await appendEvent(envEvent);
-    state = applyEvent(state, envEvent);
-    currentState = state;
-    stateHistory.push(state);
-    if (stateHistory.length > HISTORY_SIZE) {
-      stateHistory.shift();
-    }
-
-    // 每 6 次 tick（约 1 分钟）输出一次状态，避免刷屏
-    if (tickCount % 6 === 0) {
-      console.log(formatState(state));
-    }
-
-    // 每小时输出一次汇总
-    if (tickCount % 360 === 0) {
-      const hours = (state.uptimeSeconds / 3600).toFixed(2);
-      console.log(`\n--- ${hours}h checkpoint ---`);
-      console.log(formatState(state));
-      console.log('------------------------\n');
-    }
+          return batch;
+        } catch (err) {
+          // 写库失败：中止本次 tick（不静默回退 JSONL），状态机停在本 tick 起点。
+          // 异常继续向上抛出，RuntimeSession 会把下一轮 Tick 升级为 recovery-tick。
+          console.error('[EventStore] tick 持久化失败，已中止本次 tick:', err);
+          throw err;
+        }
+      })
+      // 被合并的 Tick 请求共享同一结果；失败日志已在任务内输出一次
+      .catch(() => undefined);
   };
   const interval = setInterval(() => {
-    if (tickInFlight) return;
-    tickInFlight = true;
-    void runTick()
-      .catch((err) => {
-        // 写库失败：中止本次 tick（不静默回退 JSONL），状态机停在本 tick 起点，
-        // 已持久化的事件流仍是内存状态的一致前缀
-        console.error('[EventStore] tick 持久化失败，已中止本次 tick:', err);
-      })
-      .finally(() => {
-        tickInFlight = false;
-      });
+    void runTick();
   }, TICK_INTERVAL_MS);
 
-  // 优雅关闭
+  // 优雅关闭（C3.1：drained 判定 + 显式 forced 路径）
+  //
+  // 正常路径：
+  //   1. 停止定时 Tick（新任务入口由 RuntimeSession 关闭后同步拒绝）
+  //   2. runtimeSession.shutdown()：排空等待队列、取消提取中的 LLM 请求、
+  //      带宽限期等待执行中任务
+  //   3. drained=true → 执行器已无 running 任务 → 允许 closeDb
+  //      drained=false → 禁止立即 closeDb；waitForIdle() 等待 running 任务
+  //      真正结束（成功/失败都记录日志），之后才能关闭数据库
+  //   4. 数据库安全关闭后才 process.exit(0)
+  //
+  // forced shutdown（显式路径）：
+  //   正常关闭期间再次收到 SIGINT/SIGTERM → 立即 process.exit(1)，
+  //   可能中断执行中任务与数据库连接，日志明确标注为强制退出。
+  let shutdownStarted = false;
   const shutdown = async (signal: string): Promise<void> => {
+    if (shutdownStarted) {
+      console.error(
+        `\n[Forced shutdown] 再次收到 ${signal}：立即退出，执行中任务与数据库连接可能被中断`,
+      );
+      process.exit(1);
+    }
+    shutdownStarted = true;
+
     console.log(`\nReceived ${signal}, shutting down...`);
     clearInterval(interval);
-    console.log(`Final state: ${formatState(state)}`);
-    console.log(`Total ticks: ${tickCount}`);
+
+    const result = await runtimeSession.shutdown();
+    console.log(
+      `RuntimeSession shutdown: drained=${result.drained} running=${result.running} ` +
+        `timedOut=${result.timedOut} drainedChats=${result.drainedChats} ` +
+        `discardedTick=${result.discardedTick}`,
+    );
+
+    if (!result.drained) {
+      // 禁止静默关闭数据库：执行中任务仍持有数据库事务，必须等它真正结束
+      console.warn(
+        '执行器未在宽限期内排空，等待 running task 真正结束后再关闭数据库 ' +
+          '（再次发送信号可 forced shutdown）...',
+      );
+      const outcome = await runtimeSession.waitForIdle();
+      console.log(`running task 最终结局: ${outcome}`);
+    }
+
     await closeDb();
+    console.log(`Final state: ${formatState(state)}`);
+    console.log(`Total ticks: ${tickSession.tickCount}`);
     process.exit(0);
   };
 

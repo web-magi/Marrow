@@ -29,12 +29,23 @@
  *   lastTickTime=启动时刻 是本阶段有意为之的语义，不是缺陷。
  */
 import type postgres from 'postgres';
-import { VALID_OBSERVATION_SOURCES, type EventType } from './events.js';
-import { applyEvent, createInitialState, type MarrowState } from './state.js';
+import {
+  VALID_OBSERVATION_SOURCES,
+  type EventType,
+  type GenesisEvent,
+} from './events.js';
+import {
+  applyEvent,
+  applyGenesis,
+  createInitialState,
+  type MarrowState,
+} from './state.js';
 import {
   ENGINE_VERSION,
   IDENTITY_ID,
   SCHEMA_VERSION,
+  appendEvents,
+  canonicalize,
   loadEventRows,
   type PersistedEventRow,
 } from './storage.js';
@@ -146,6 +157,7 @@ function isSupportedEngineVersion(engineVersion: string | null): boolean {
 // ==================================================================
 
 const KNOWN_EVENT_TYPES: ReadonlySet<string> = new Set<EventType>([
+  'genesis',
   'tick',
   'interruption',
   'environment',
@@ -241,6 +253,54 @@ function validateRowForReplay(row: PersistedEventRow): ReplayError | null {
   // 这里严格校验而不是用默认值兜底，是为了让「数据损坏 / 未知来源写入」
   // 在启动时明确暴露，而不是被静默吞掉后产出错误状态。
   switch (event.type as EventType) {
+    case 'genesis': {
+      // 校验 DB 反序列化的 payload 对象的字段存在性——这里不假设具体 TS 类型，
+      // 因为 DB JSONB 可以包含任何东西；使用 any 是有意为之：只要字段缺失即 fail-closed
+      const s: any = payload.initialState;
+      if (
+        !s ||
+        typeof s !== 'object' ||
+        !isFiniteNumber(s.energy) ||
+        !isFiniteNumber(s.moodBaseline) ||
+        !isFiniteNumber(s.arousal) ||
+        typeof s.interruptionFlag !== 'boolean' ||
+        !isFiniteNumber(s.trust) ||
+        !isFiniteNumber(s.defensiveness) ||
+        !isFiniteNumber(s.cognitiveLoad) ||
+        !isFiniteNumber(s.associationWeight) ||
+        !s.traits ||
+        typeof s.traits !== 'object' ||
+        !isFiniteNumber(s.traits.neuroticism) ||
+        !isFiniteNumber(s.traits.agreeableness) ||
+        !isFiniteNumber(s.traits.extraversion) ||
+        !isFiniteNumber(s.traits.resilience) ||
+        !isFiniteNumber(s.batteryLevel) ||
+        !isFiniteNumber(s.attentionFocus) ||
+        !isFiniteNumber(s.socialHunger) ||
+        !Array.isArray(s.associations) ||
+        !Array.isArray(s.episodicBuffer) ||
+        !isFiniteNumber(s.interruptionScars) ||
+        !isFiniteNumber(s.needValidation) ||
+        !isFiniteNumber(s.needNovelty) ||
+        !isFiniteNumber(s.needSecurity) ||
+        typeof s.sleeping !== 'boolean' ||
+        !isFiniteNumber(s.uptimeSeconds) ||
+        !isFiniteNumber(s.interruptionCount)
+      ) {
+        return fail('invalid_payload', 'genesis.initialState 缺少必要字段或类型错误');
+      }
+      if (!isFiniteNumber(payload.configVersion)) {
+        return fail('invalid_payload', 'genesis 缺少 configVersion');
+      }
+      if (!isNonEmptyString(payload.initializedBy)) {
+        return fail('invalid_payload', 'genesis 缺少 initializedBy');
+      }
+      if (!Array.isArray(payload.seedEpisodicIds)) {
+        return fail('invalid_payload', 'genesis 缺少 seedEpisodicIds 数组');
+      }
+      return null;
+    }
+
     case 'tick':
       if (!isFiniteNumber(payload.deltaSeconds)) {
         return fail('invalid_payload', 'tick 缺少有限数值 payload.deltaSeconds');
@@ -462,14 +522,51 @@ export function replayPersistedEvents(
     return { ...base, verdict: 'empty', errors: [] };
   }
 
-  let state = createInitialState(rows[0]!.payload.timestamp);
+  // ---- 首事件必须是 genesis（M1.3 Fresh Start），否则用 createInitialState 兼容旧链 ----
+  // 说明：首事件不是 genesis 时也能 Replay，createInitialState 会以首事件 timestamp
+  // 构建空状态再依次 applyEvent——这是兼容 M1.2 历史链（无 genesis）的回退路径；
+  // 但新 identity 必须创建 genesis，否则 Fresh Start 流程会拒绝。
+  const firstType = rows[0]!.event_type;
+  let state: MarrowState;
+  if (firstType === 'genesis') {
+    // applyGenesis 从快照直接产出完整状态，不需要前置 state
+    // rows[0] 来自 DB，payload 类型是 MarrowEvent——在 firstType==='genesis' 分支
+    // 语义上它必定是 GenesisEvent，但 TS 判别联合不跨数据库行类型自动收窄，
+    // 需要显式断言
+    const initialSnapshot = applyGenesis(rows[0]!.payload as GenesisEvent);
+    state = initialSnapshot;
+  } else {
+    state = createInitialState(rows[0]!.payload.timestamp);
+  }
 
-  for (const row of rows) {
+  // genesis 在首行时 state 已由 applyGenesis 初始化，循环从 index 1 开始，
+  // 避免对 genesis 行重复执行 applyEvent（applyEvent 对 genesis 调 applyGenesis 但
+  // 不会改变已由 createInitialState 构建的内容——这里显式跳过，语义更清晰）
+  for (let i = firstType === 'genesis' ? 1 : 0; i < rows.length; i++) {
+    const row = rows[i]!;
+    if (row.event_type === 'genesis') {
+      // 同一 identity 不允许出现两个 genesis——DB 层约束已保证，但 Replay 必须再确认一次
+      return {
+        ...base,
+        verdict: 'invalid',
+        errors: [
+          {
+            identityId,
+            sequence: row.sequence,
+            eventId: row.event_id,
+            eventType: row.event_type,
+            schemaVersion: row.schema_version,
+            engineVersion: row.engine_version,
+            kind: 'invalid_payload',
+            message: '同一 identity 事件链中出现多个 genesis（Replay fail-closed）',
+          },
+        ],
+      };
+    }
     const invalid = validateRowForReplay(row);
     if (invalid) {
       return { ...base, verdict: 'invalid', errors: [invalid] };
     }
-    // 校验通过后类型已收窄：type 属于已知判别联合
     state = applyEvent(state, row.payload);
   }
 
@@ -615,6 +712,173 @@ export async function recoverIdentityOrThrow(
     throw new RecoveryError(result);
   }
   return result;
+}
+
+// ==================================================================
+// M1.3 Fresh Start：创建全新身份的 genesis
+// ==================================================================
+
+/**
+ * Fresh Start：在空 identity 上原子创建 genesis 事件并验证 Replay 一致性。
+ *
+ * 严格前置条件：
+ * - 调用方必须已持有该 identity 的 ownership lock（防并发初始化）
+ * - 调用方已先 verifyEventChain 且 verdict=empty（防重复创建 genesis）
+ *
+ * 执行流程：
+ * 1. 用 createInitialState 构建初始状态 → 写入 GenesisEvent.payload.initialState
+ * 2. appendEvents 原子写入（单事件单事务）
+ * 3. 再次 verifyEventChain —— 必须 valid，首行是 genesis（prevHash=NULL）
+ * 4. recoverIdentity —— 必须 valid
+ * 5. 比较 genesis.payload.initialState 与 replayResult.finalState 的业务字段
+ *    （lastUpdated 允许不同——applyGenesis 会把它覆盖为 event.timestamp）
+ * 6. 返回 recoverIdentity 结果（调用方据此取得 finalState）
+ *
+ * 为什么不把 Fresh Start 内联到 main() 里：
+ * - 需要 appendEvents 写入 + verify + recover 完整闭环验证，
+ *   散落在 main() 会让启动路径变复杂且难以测试
+ * - 这是唯一允许"向数据库写第一条事件"的公开入口，集中在一个函数里
+ *   方便审计谁在什么时候写入了 genesis
+ *
+ * commit-unknown 安全：appendEvents 使用 ON CONFLICT (event_id) DO NOTHING +
+ * 全量不可变元数据冲突检查，重试时原批次零新增。
+ */
+export async function freshStartIdentity(
+  identityId: string = IDENTITY_ID,
+): Promise<ReplayResult> {
+  // 前置防御：确认调用方已执行 verify + ownership
+  const preChain = await verifyEventChain(identityId);
+  if (preChain.verdict === 'invalid') {
+    throw new Error(
+      `freshStartIdentity 前置哈希链验证失败：${preChain.errors[0]?.message ?? 'unknown'}`,
+    );
+  }
+  if (preChain.verdict === 'valid') {
+    // 已经有 genesis——调用方没检查 empty 就调用了，属于编程错误
+    throw new Error(
+      `freshStartIdentity 拒绝：identity ${identityId} 已存在事件链（${preChain.eventCount} 条），不得重复 Fresh Start`,
+    );
+  }
+  // preChain.verdict === 'empty' → 正常继续
+
+  // 1. 构建初始状态快照
+  const genesisTimestamp = new Date().toISOString();
+  const initial = createInitialState(genesisTimestamp);
+
+  // 从 createInitialState 结果里提取种子情景记忆 ID（genesis 里必须显式声明）
+  const seedEpisodicIds = initial.episodicBuffer.map((m) => m.id);
+
+  const genesis: GenesisEvent = {
+    type: 'genesis',
+    // event id 由 appendEvents 内 generateEventId 统一分配——freshStartIdentity
+    // 不显式指定，避免与 storage.ts 的 id 生成规则分裂
+    id: '', // 占位，appendEvents 内部会覆盖
+    timestamp: genesisTimestamp,
+    payload: {
+      initialState: {
+        energy: initial.energy,
+        moodBaseline: initial.moodBaseline,
+        arousal: initial.arousal,
+        interruptionFlag: initial.interruptionFlag,
+        trust: initial.trust,
+        defensiveness: initial.defensiveness,
+        cognitiveLoad: initial.cognitiveLoad,
+        associationWeight: initial.associationWeight,
+        traits: { ...initial.traits },
+        batteryLevel: initial.batteryLevel,
+        attentionFocus: initial.attentionFocus,
+        socialHunger: initial.socialHunger,
+        associations: [...initial.associations],
+        episodicBuffer: [...initial.episodicBuffer],
+        interruptionScars: initial.interruptionScars,
+        needValidation: initial.needValidation,
+        needNovelty: initial.needNovelty,
+        needSecurity: initial.needSecurity,
+        lastEvokedMemory: initial.lastEvokedMemory,
+        lastBehavior: { ...initial.lastBehavior },
+        uptimeSeconds: initial.uptimeSeconds,
+        interruptionCount: initial.interruptionCount,
+        sleeping: initial.sleeping,
+        sleepEntryTrust: initial.sleepEntryTrust,
+        sleepEntryCognitiveLoad: initial.sleepEntryCognitiveLoad,
+        sleepEntryDefensiveness: initial.sleepEntryDefensiveness,
+      },
+      configVersion: 1,
+      initializedBy: 'system',
+      seedEpisodicIds,
+    },
+  };
+  // appendEvents 会给事件分配 id、prevHash、计算哈希——这里传空 id 让它处理
+  const genesisToWrite: GenesisEvent = {
+    ...genesis,
+    id: `genesis-${identityId}-${genesisTimestamp}`,
+  };
+
+  // 2. 原子写入
+  await appendEvents([genesisToWrite], { identityId });
+
+  // 3. 再次验证哈希链
+  const postChain = await verifyEventChain(identityId);
+  if (postChain.verdict !== 'valid') {
+    throw new Error(
+      `Fresh Start 后哈希链验证失败：${postChain.errors.map((e) => e.message).join('; ')}`,
+    );
+  }
+  if (postChain.eventCount !== 1) {
+    throw new Error(
+      `Fresh Start 事件数异常：预期 1 条 genesis，实际 ${postChain.eventCount} 条`,
+    );
+  }
+
+  // 4. Replay
+  const replayResult = await recoverIdentity(identityId);
+  if (replayResult.verdict !== 'valid') {
+    throw new RecoveryError(replayResult);
+  }
+
+  // 5. 比较 genesis.payload.initialState 与 Replay 结果
+  // 关键细节：traits / episodicBuffer / associations / lastBehavior 都是
+  // 嵌套对象或数组，经过 DB JSONB 往返后 JavaScript 返回的对象键序可能变化
+  // （JSON 规范不保证对象键序；postgres.js 解析 JSONB 返回 plain object）。
+  // 因此这里用 canonicalize（storage.ts 导出的稳定键序 JSON）做嵌套比较，
+  // 而非直接 JSON.stringify 或 === —— 它们会被键序差异误伤。
+  const recovered = replayResult.finalState!;
+  const snap = genesis.payload.initialState;
+  const mismatch =
+    recovered.energy !== snap.energy ||
+    recovered.moodBaseline !== snap.moodBaseline ||
+    recovered.arousal !== snap.arousal ||
+    recovered.interruptionFlag !== snap.interruptionFlag ||
+    recovered.trust !== snap.trust ||
+    recovered.defensiveness !== snap.defensiveness ||
+    recovered.cognitiveLoad !== snap.cognitiveLoad ||
+    recovered.associationWeight !== snap.associationWeight ||
+    canonicalize(recovered.traits) !== canonicalize(snap.traits) ||
+    recovered.batteryLevel !== snap.batteryLevel ||
+    recovered.attentionFocus !== snap.attentionFocus ||
+    recovered.socialHunger !== snap.socialHunger ||
+    canonicalize(recovered.associations) !== canonicalize(snap.associations) ||
+    canonicalize(recovered.episodicBuffer) !== canonicalize(snap.episodicBuffer) ||
+    recovered.interruptionScars !== snap.interruptionScars ||
+    recovered.needValidation !== snap.needValidation ||
+    recovered.needNovelty !== snap.needNovelty ||
+    recovered.needSecurity !== snap.needSecurity ||
+    recovered.lastEvokedMemory !== snap.lastEvokedMemory ||
+    canonicalize(recovered.lastBehavior) !== canonicalize(snap.lastBehavior) ||
+    recovered.uptimeSeconds !== snap.uptimeSeconds ||
+    recovered.interruptionCount !== snap.interruptionCount ||
+    recovered.sleeping !== snap.sleeping ||
+    recovered.sleepEntryTrust !== snap.sleepEntryTrust ||
+    recovered.sleepEntryCognitiveLoad !== snap.sleepEntryCognitiveLoad ||
+    recovered.sleepEntryDefensiveness !== snap.sleepEntryDefensiveness;
+
+  if (mismatch) {
+    throw new Error(
+      'Fresh Start Replay 结果与 genesis.initialState 不一致——确定性失败，拒绝启动',
+    );
+  }
+
+  return replayResult;
 }
 
 // ==================================================================

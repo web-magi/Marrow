@@ -12,6 +12,7 @@
 
 /** 事件类型判别字段 */
 export type EventType =
+  | 'genesis'
   | 'tick'
   | 'interruption'
   | 'environment'
@@ -265,6 +266,7 @@ export interface AppraisalEvent extends BaseEvent {
 
 /** 事件联合类型 */
 export type MarrowEvent =
+  | GenesisEvent
   | TickEvent
   | InterruptionEvent
   | EnvironmentEvent
@@ -423,6 +425,68 @@ export interface EpisodicMemory {
   sourceEventId?: string;
   /** 是否为创伤性记忆（唤醒时除拉低心情外还会增加内耗） */
   isTrauma?: boolean;
+}
+
+/**
+ * GenesisEvent —— 身份初始化事件（M1.3 Fresh Start）
+ *
+ * 设计要点：
+ * - 每个 identity 唯一的第一条事件，previous_event_hash 必须为 NULL
+ * - 承载初始状态的完整参数快照，Replay 从这一条事件确定性重建初始状态
+ * - 不使用 Date.now() / Math.random() 在 Replay 中重新生成初始值；
+ *   所有初始值必须原样落在 payload 里
+ * - 数据库约束 uniq_events_identity_genesis 保证同一 identity 只能有一条
+ *   prevHash=NULL 行，verifyEventChain 额外检查 genesis_count===1 且在首行
+ *
+ * 为什么不用 TickEvent 代替：
+ * - Genesis 语义不同于第一次 Tick：Tick 是时间增量演化，Genesis 是完整
+ *   状态快照；让 Replay 从 tick(delta=0) 推导"空状态"与"白纸"概念不符
+ * - 独立类型让 verifyEventChain / Replay 的 genesis 唯一性检查更明确
+ */
+export interface GenesisEvent extends BaseEvent {
+  type: 'genesis';
+  payload: {
+    /** 初始状态的完整快照（Replay 据此直接构建 finalState，不调用 createInitialState） */
+    initialState: {
+      energy: number;
+      moodBaseline: number;
+      arousal: number;
+      interruptionFlag: boolean;
+      trust: number;
+      defensiveness: number;
+      cognitiveLoad: number;
+      associationWeight: number;
+      traits: {
+        neuroticism: number;
+        agreeableness: number;
+        extraversion: number;
+        resilience: number;
+      };
+      batteryLevel: number;
+      attentionFocus: number;
+      socialHunger: number;
+      associations: readonly AssociationMemory[];
+      episodicBuffer: readonly EpisodicMemory[];
+      interruptionScars: number;
+      needValidation: number;
+      needNovelty: number;
+      needSecurity: number;
+      lastEvokedMemory: string | null;
+      lastBehavior: { kind: 'idle' | 'rest' | 'quiet' | 'active' | 'interrupted'; reason: string };
+      uptimeSeconds: number;
+      interruptionCount: number;
+      sleeping: boolean;
+      sleepEntryTrust: number;
+      sleepEntryCognitiveLoad: number;
+      sleepEntryDefensiveness: number;
+    };
+    /** 初始化配置版本（便于未来识别旧版初始状态） */
+    configVersion: number;
+    /** 初始化者（'system' | 'migration' | 其他） */
+    initializedBy: string;
+    /** 种子情景记忆 ID 列表（明确声明哪些情景记忆进入初始状态） */
+    seedEpisodicIds: readonly string[];
+  };
 }
 
 /**

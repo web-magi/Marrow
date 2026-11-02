@@ -15,6 +15,7 @@
 
 import type {
   MarrowEvent,
+  GenesisEvent,
   TickEvent,
   InterruptionEvent,
   EnvironmentEvent,
@@ -458,6 +459,51 @@ function extractKeywords(text: string, maxTokens = 6): string[] {
  * - associations：显著性缓慢衰减
  * - sleeping：睡眠自愈（情绪回归 vs 夜间反刍）
  */
+
+/**
+ * applyGenesis —— 身份初始化（M1.3 Fresh Start）
+ *
+ * 这是唯一不接收"前置 state"的 applyXxx 函数。
+ * GenesisEvent.payload.initialState 携带完整快照，Replay 据此直接构建
+ * finalState，不调用 createInitialState 重新计算任何值。
+ *
+ * 不修改 payload.initialState 的任何字段（保证 Replay 确定性），
+ * 只把 lastUpdated 覆盖为 event.timestamp（这是事件自身的元数据，
+ * 不影响"快照是什么"的语义）。
+ */
+export function applyGenesis(event: GenesisEvent): MarrowState {
+  const snap = event.payload.initialState;
+  return {
+    energy: snap.energy,
+    moodBaseline: snap.moodBaseline,
+    arousal: snap.arousal,
+    interruptionFlag: snap.interruptionFlag,
+    trust: snap.trust,
+    defensiveness: snap.defensiveness,
+    cognitiveLoad: snap.cognitiveLoad,
+    associationWeight: snap.associationWeight,
+    traits: { ...snap.traits },
+    batteryLevel: snap.batteryLevel,
+    attentionFocus: snap.attentionFocus,
+    socialHunger: snap.socialHunger,
+    associations: [...snap.associations],
+    episodicBuffer: [...snap.episodicBuffer],
+    interruptionScars: snap.interruptionScars,
+    needValidation: snap.needValidation,
+    needNovelty: snap.needNovelty,
+    needSecurity: snap.needSecurity,
+    lastEvokedMemory: snap.lastEvokedMemory,
+    lastBehavior: { ...snap.lastBehavior },
+    lastUpdated: event.timestamp,
+    uptimeSeconds: snap.uptimeSeconds,
+    interruptionCount: snap.interruptionCount,
+    sleeping: snap.sleeping,
+    sleepEntryTrust: snap.sleepEntryTrust,
+    sleepEntryCognitiveLoad: snap.sleepEntryCognitiveLoad,
+    sleepEntryDefensiveness: snap.sleepEntryDefensiveness,
+  };
+}
+
 function applyTick(state: MarrowState, event: TickEvent): MarrowState {
   const delta = event.payload.deltaSeconds;
   const c = STATE_CONSTANTS;
@@ -1099,6 +1145,8 @@ export function applyEvent(
   event: MarrowEvent,
 ): MarrowState {
   switch (event.type) {
+    case 'genesis':
+      return applyGenesis(event);
     case 'tick':
       return applyTick(state, event);
     case 'interruption':

@@ -24,8 +24,14 @@ import { join } from 'node:path';
 import type { EventLog, MarrowEvent } from './events.js';
 import { getDb } from './db/connection.js';
 
-/** V2 主身份 ID（Fresh Start：与 V1 历史数据完全隔离） */
-export const IDENTITY_ID = 'marrow-primary';
+/**
+ * V2 主身份 ID（M1.3 Fresh Start）。
+ * - 与 M1.3 之前的 marrow-primary 完全隔离：两个身份各有独立的事件链、
+ *   独立的 identity ownership 锁、独立的运行时状态。
+ * - V1 JSONL 继续作为独立封存档案，本 ID 启动的任何流程都不读取 V1 数据。
+ * - 同一 PostgreSQL 数据库中，两个 identity 通过 identity_id 列自然隔离。
+ */
+export const IDENTITY_ID = 'marrow-v2';
 
 /** M1 起新写入事件的 schema 版本 */
 export const SCHEMA_VERSION = 2;

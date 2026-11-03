@@ -56,35 +56,34 @@ Marrow 是一个**可长期运行、可发育、可回放**的 AI 伴侣运行�
 
 ## 当前阶段
 
-🚧 **V2 架构迁移 M1：PostgreSQL 持久化 + Fresh Start 初始化**
+**✅ M1 V2 架构迁移全部完成。M1.4.1 Episodic Memory Eventization 已完成。M1.4.2 记忆生命周期规划中。**
 
-- 阶段四（对话管道与主观评估）与 M0（确定性回放、观察—评价事件链）已完成。
-- M1.1 数据库基础设施已完成：PostgreSQL 16 + events 表（哈希链）+ 迁移版本管理。
-- M1 路线：M1.2 EventStore 迁移 → M1.3 V2 Fresh Start 初始化 → M1.4 V2 全新运行验收。
-- V2 采用 Fresh Start：V1 历史 JSONL 仅作只读档案，不导入 V2；V2 使用全新 identity_id 从空状态起步。
-- 完整架构规范与数据隔离方案见 [Marrow_README_V2.md](Marrow_README_V2.md)（§4.5、§6）。
+- M1.1–M1.3（PostgreSQL 基础设施 → EventStore 迁移 → Fresh Start 初始化）已完成。
+- **M1.4.1：Episodic Memory Eventization 已完成**（commit `30e340e`）：
+  - MemoryFormationEvent 独立事件化，DialogueEvent 不再直接写 episodicBuffer。
+  - 统一 computeEpisodicMemoryCandidate 候选计算入口。
+  - Recovery 完整契约校验（11 条约束，validateMemoryFormationPayload 纯函数）。
+  - 222/222 测试通过（M1-M11 + R1-R5）。
+- V2 Fresh Start：V1 历史 JSONL 独立封存，不导入 V2；V2 从空状态起步。
+- 下一阶段：**M1.4.2 — Episodic Memory Lifecycle**（记忆形成后的保留/强化/衰减/关联/遗忘）。
+- 详细里程碑、架构事实和阶段规划见 [Marrow_README_V2.md](Marrow_README_V2.md)。
 
-## 目录结构
-Marrow/
-├── ARCHITECTURE.md # 架构讨论纪要（完整设计文档）
-├── README.md # 本文件
-├── .gitignore
-└── src/
-├── events.ts # 事件类型判别联合 + exhaustive check
-├── state.ts # 状态结构与转移函数
-├── appraisal.ts # 意图评估与主观情绪计算 (核心涌现引擎)
-└── replay.ts # 从事件日志重建状态与权重
+## 路线图概览
 
-## 路线图
-
-- [x] 架构讨论与设计文档
 - [x] 阶段一：最小状态机
 - [x] 阶段二：回放与可视化
 - [x] 阶段三：环境与中断接入
-- [x] 阶段四：对话作为输出通道与主观评估
-- [ ] M1：PostgreSQL 持久化迁移与 V2 Fresh Start 初始化（当前进行中）
-- [ ] 阶段五：记忆聚合调优与 Python 旁路（性格涌现的起点）
-- [ ] 阶段六：外接躯体（硬件层）
+- [x] 阶段四：对话管道与主观评估
+- [x] M1：PostgreSQL 持久化迁移与 V2 Fresh Start 初始化
+- [x] M1.4.1：Episodic Memory Eventization
+- [ ] M1.4.2：Episodic Memory Lifecycle（记忆生命周期）
+- [ ] 阶段五完整：记忆聚合调优与关联网络
+- [ ] 阶段六：行为倾向与开放式涌现
+- [ ] 阶段七：自我模型与身份连续性
+- [ ] 阶段八：长期自主运行
+- [ ] 阶段九：外接躯体（硬件层）
+
+详细里程碑和每项的验收标准见 [Marrow_README_V2.md §6](Marrow_README_V2.md)。
 
 ---
 

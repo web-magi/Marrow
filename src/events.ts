@@ -451,9 +451,9 @@ export interface EpisodicMemory {
   /** 显著性 0-1，越高越容易被唤醒 */
   salience: number;
   /** 关联的对话事件 ID（可溯源） */
-  sourceEventId?: string;
+  sourceEventId: string;
   /** 是否为创伤性记忆（唤醒时除拉低心情外还会增加内耗） */
-  isTrauma?: boolean;
+  isTrauma: boolean;
 }
 
 /**

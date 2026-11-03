@@ -187,306 +187,165 @@ interface Observation {
 
 ### 3.3 Body & State Engine
 
-负责身体状态的确定性转移。
+负责身体状态的确定性转移。所有状态字段都在单一的 `MarrowState` 接口中定义，由事件重放确定，不存在独立的 BodyState / RelationshipState 拆分。
 
-```typescript
-interface BodyState {
-  energy: number;
-  mood: number;
-  moodBaseline: number;
-  arousal: number;
-  recoveryLevel: number;
+**当前 MarrowState 结构**（`src/state.ts`）：
 
-  updatedAt: number;
-  revision: number;
-}
-```
+- `energy` / `moodBaseline` / `arousal`：核心身体变量（能量、心境基线、唤醒度）
+- `trust` / `defensiveness` / `cognitiveLoad`：信任与防御层（信任度、防御墙、内耗反刍）
+- `associationWeight`：动态关联权重（记忆聚合演化，初始 1.0）
+- `traits: PersonalityTraits`：性格特质（neuroticism/agreeableness/extraversion/resilience/openness，全局底层系数，初始全 1.0，仅通过 TraitShiftEvent 微量漂移）
+- `batteryLevel` / `attentionFocus` / `socialHunger`：电池、注意力、社交渴望
+- `needValidation` / `needNovelty` / `needSecurity`：三种心理需求（被认可、新鲜感、安全感）
+- `interruptionFlag` / `interruptionScars` / `interruptionCount`：中断相关（标志、伤痕、次数）
+- `associations: AssociationMemory[]`：长期关联记忆（含中断伤痕）
+- `episodicBuffer: EpisodicMemory[]`：情景记忆缓冲区（由 MemoryFormationEvent 写入，容量上限 50）
+- `lastEvokedMemory` / `lastBehavior` / `uptimeSeconds` / `sleeping` / `sleepEntry*`：派生/进程临时/睡眠冻结值
 
-关系状态应独立建模，避免把关系亲密度混入单一情绪值：
+**设计原则**：
 
-```typescript
-interface RelationshipState {
-  subjectId: string;
-  affinity: number;
-  confidence: number;
-  updatedAt: number;
-}
-```
+- 所有数值都有明确范围和初始值。
+- 状态变化必须通过核心事件执行，由 `applyEvent` switch 确定性转移。
+- 状态转移可测试、可回放、可重建。
+- 时间流逝本身（Tick）可以产生状态变化。
+- 不同变量使用不同动力学（随机游走、均值回归、线性衰减、非线性惩罚等）。
+- 特质（traits）与瞬态变量严格分离：特质是底层系数（人格），变量是即时状态。
 
-要求：
-
-- 所有数值都有范围和默认值。
-- 状态变化必须通过核心命令执行。
-- 状态转移必须可测试、可回放。
-- 时间流逝本身可以产生状态变化。
-- 不同变量使用不同变化速度。
-- 状态不能因为 LLM 回复内容而被直接覆盖。
-
-初期可使用简单、稳定、可解释的动力学模型，后续再根据实验调整。
+> **历史设计**：早期草案曾考虑 BodyState / RelationshipState 独立接口和 `affinity` 字段，V2 实现时选择了单一 MarrowState + `trust` 替代 `affinity`。`recoveryLevel` 概念也已废弃。当前以上述实现为准。
 
 ### 3.4 Appraisal Engine
 
-将 Observation 转化为主观评估。
+将 Observation 转化为主观评估。核心函数 `appraise(action, intensity, context)` 定义在 `src/appraisal.ts`，输出多维 AppraisalResult（见下方接口）。
 
-初始公式可以保留：
+**输入**（AppraisalContext）：
 
-```text
-Mood_delta =
-  Action_Value
-  × Association_Weight
-  × Speaker_Affinity
-```
+- 当前状态变量：associationWeight / trust / defensiveness / moodBaseline / needValidation / needNovelty / needSecurity
+- traits：性格特质（neuroticism 等，全局底层系数）
+- confidence：观察置信度（0-1，来自 ObservationEvent）
+- evidenceAssociationIds：被唤醒的关联记忆 ID 列表
 
-但该公式只作为第一版简化模型，不应成为唯一评估通道。
+**输出**（AppraisalResult）：
 
-建议逐步扩展为多维评估：
+| 字段 | 类型 | 作用 |
+|---|---|---|
+| `valenceDelta` | number | 对 moodBaseline 的效价影响量（Mood_delta 语义） |
+| `arousalDelta` | number | 对 arousal 的唤醒影响量（≥0） |
+| `energyDelta` | number | 预留扩展（当前未使用） |
+| `energyCost` | number | 本次对话的物理能量消耗（基础 0.5 + 强度系数） |
+| `trustDelta` | number | 对 trust 的增减（正行为增、负行为减） |
+| `needDeltas` | { validation, novelty, security } | 三种需求的扣减量 |
+| `confidence` | number | 透传（供 AppraisalEvent 记录） |
+| `evidenceAssociationIds` | string[] | 透传（供 AppraisalEvent 记录证据链） |
 
-```typescript
-interface AppraisalResult {
-  valenceDelta: number;
-  arousalDelta: number;
-  energyDelta: number;
+**核心机制**：
 
-  familiarity: number;
-  novelty: number;
-  socialImpact: number;
+- `Action_Value`（行为固有值）× `Association_Weight` × `Trust_Multiplier`（trust/50）× 注意力调制 = 基础 valenceDelta
+- 防御墙（defensiveness > 70）拦截正向安抚：正向 valenceDelta 保留比例从 100% 削减到 20%
+- 三种需求的满足程度决定 moodBonus 和 needDeltas：需求越高，满足的加成越大（久旱逢甘霖），被反向刺激的惩罚越大（伤口撒盐）
+- 低置信度输入直接降低所有输出（按 confidence 比例衰减）
+- Appraisal 结果完整持久化为 AppraisalEvent，payload 携带 sourceObservationId + confidence + evidenceAssociationIds
 
-  confidence: number;
-  evidenceAssociationIds: string[];
-  sourceObservationId: string;
-}
-```
+**设计原则**：
 
-要求：
+- Appraisal 由核心引擎计算，不由 LLM 决定。
+- 同一句输入因身体状态和历史关联不同可产生不同结果。
+- 评估保留置信度和证据来源，不掩盖不确定性。
+- 不允许 LLM 直接返回最终 mood_delta 写入状态。
+- 评估结果必须作为事件持久化（AppraisalEvent）。
 
-- Appraisal 由核心引擎计算。
-- 同一句输入可以因身体状态和历史关联不同而产生不同结果。
-- 评估必须保留置信度和证据来源。
-- 不允许 LLM 直接返回最终 `mood_delta` 并写入状态。
-- 低置信度输入应降低影响或进入待确认流程。
-- 评估结果必须作为事件持久化。
+> **历史设计**：早期简化公式 `Mood_delta = Action_Value × Association_Weight × Speaker_Affinity` 不再属于当前 V2 实现。当前 appraisal.ts 是多维评估，输出 8 字段的 AppraisalResult。
 
 ### 3.5 Memory Engine
 
-记忆系统分为三个主要层次。
+记忆系统分为三个层次。当前 V2 只实现了 Episodic Memory 和 Associative Memory 的最小版本，Semantic Memory 和完整 Development Engine 属于长期规划。
 
-#### Episodic Memory：情景记忆
+#### Episodic Memory（已实现，M1.4.1）
 
-记录具体发生过的经历：
+最小可行的情景记忆快照。每条记忆由 `MemoryFormationEvent` 独立写入（不再是 DialogueEvent 的隐式副作用）。
 
-- 时间和环境。
-- 参与者。
-- 输入与观察。
-- 当时身体状态。
-- Appraisal 结果。
-- 系统采取的行为。
-- 行为持续时间。
-- 实际后果。
-- 关联事件 ID。
-
-情景记忆是对原始事件的索引和组织，不是原始事件的替代品。
-
-#### Semantic Memory：语义记忆
-
-从多次经历中形成可检索的规律和概念，例如：
-
-- 某个时间段经常出现某类环境。
-- 某类事件与某种状态经常同时出现。
-- 某个对象在不同时间段表现出不同交互模式。
-
-语义记忆必须保留来源证据、置信度和更新时间。
-
-#### Associative Memory：动态关联记忆
-
-建立环境、身体状态、语言事件、对象、行为与结果之间的关联。
+**数据结构**（`src/events.ts`）：
 
 ```typescript
-interface Association {
-  id: string;
-
-  sourceNodeId: string;
-  targetNodeId: string;
-
-  dimensions: {
-    emotional: number;
-    physiological: number;
-    behavioral: number;
-    social: number;
-    temporal: number;
-  };
-
-  confidence: number;
-  occurrenceCount: number;
-
-  firstObservedAt: number;
-  lastActivatedAt: number;
-  createdAt: number;
-  updatedAt: number;
-
-  evidenceEventIds: string[];
-  algorithmVersion: string;
+interface EpisodicMemory {
+  id: string;              // 'epi-${dialogueEvent.id}'
+  timestamp: string;       // DialogueEvent.timestamp（ISO 8601）
+  summary: string;         // text.slice(0, 40) — 人类可读简短描述
+  keywords: string[];      // extractKeywords(text) — 关键词数组（非空 string[]）
+  valence: number;         // ±0.6 — 记忆效价
+  salience: number;        // dialogue.intensity（0-1）— 显著性
+  sourceEventId: string;   // 追溯触发的 DialogueEvent（必需，等于 payload.sourceDialogueEventId）
+  isTrauma: boolean;       // action==='insult' && intensity>=0.7
 }
 ```
 
-要求：
+**沉淀门槛**（`computeEpisodicMemoryCandidate`，`src/state.ts`）：
 
-- 关联权重不是人格标签。
-- 允许正负关联并存。
-- 允许关联衰减、修正和反转。
-- 不允许单次事件直接固化长期倾向。
-- 关联必须有证据来源。
-- 不同维度分别学习，避免把复杂经历压缩成单一正负值。
+1. `direction === 'user_input'`
+2. `action !== undefined` 且 `intensity !== undefined`
+3. `intensity >= 0.5`
+4. `|weightedMoodDelta + memoryMoodDelta| >= 1.0`
+5. `extractKeywords(text).length > 0`
 
-#### Experience Outcome：经历结果
+**职责边界**：
 
-系统必须记录行为造成的后果，而不仅仅记录外部刺激。
+- `computeEpisodicMemoryCandidate(state, DialogueEvent, evoked, baseValenceDelta)` — 纯函数，唯一候选计算入口。
+- `extractEpisodicMemory(event, weightedMoodDelta, memoryMoodDelta)` — 门槛判断 + 构造。
+- `MemoryFormationEvent` — 生产批次中的独立事件（与 Obs/Appr/Dlg/Comp 同次 `appendEvents` 原子提交）。
+- `applyMemoryFormation(state, event)` — 只读 `event.payload.memory` 追加到 `episodicBuffer`，零重计算。
 
-```typescript
-interface ExperienceOutcome {
-  eventId: string;
+**当前未记录的内容**：历史设计中描述的"当时身体状态 / Appraisal 结果 / 系统行为 / 行为持续时间 / 实际后果 / 参与者"等字段，当前 EpisodicMemory 都没有实现。这些是后续 M1.4.2 记忆生命周期可能需要的扩展方向，不属于当前契约。
 
-  beforeState: BodyState;
-  afterState: BodyState;
+#### Associative Memory（已实现最小版本）
 
-  stateDifference: Partial<BodyState>;
+长期关联记忆数组，存储在 `MarrowState.associations: AssociationMemory[]`。
 
-  actionDurationMs?: number;
-  attributionConfidence: number;
-  relatedEventIds: string[];
-}
-```
+**当前实现**：
 
-系统只能根据可观察到的结果更新关联，不能把时间相关性直接认定为因果关系。
+- `AssociationMemory` 接口定义在 `src/events.ts`（含 `id` / `isScar` / `salience` / `valence` / `keywords` 等字段）。
+- `comfort` 对话会降低伤痕显著性（`applyDialogue` 内联）。
+- `insult` 高强度对话会生成新 association（伤痕）。
+- 关联记忆无独立事件化（写入在 `applyDialogue` 内联进行），属于待事件化项。
 
-### 3.6 Development Engine
+**历史设计**：早期曾规划完整的 Association 数据结构（sourceNodeId/targetNodeId/dimensions[emotional/physiological/behavioral/social/temporal]/evidenceEventIds 等），该接口描述保留在归档参考中，当前未实现。
 
-Development Engine 是长期发育的协调模块。
+#### Semantic Memory（规划中，未实现）
 
-职责：
+从多次经历中形成可检索的规律和概念（"某时间段常出现某类环境"、"某类事件与某种状态经常同时出现"）。
 
-- 聚合情景记忆。
-- 更新动态关联。
-- 识别重复模式。
-- 形成和调整习惯。
-- 更新行为倾向。
-- 检测长期漂移。
-- 记录发育前后的差异。
-- 为每次发育变化保留证据链。
+当前代码中 **不存在** Semantic Memory 的数据结构、事件类型或处理逻辑。不标记为已实现。
 
-建议接口：
+#### Memory Retrieval（仅最小实现）
 
-```typescript
-interface DevelopmentEngine {
-  aggregateEpisodes(): Promise<void>;
-  updateAssociations(): Promise<void>;
-  detectHabitPatterns(): Promise<void>;
-  updateBehavioralTendencies(): Promise<void>;
-  detectLongTermDrift(): Promise<void>;
-  generateDevelopmentEvent(): Promise<void>;
-}
-```
+当前记忆检索通过 `evokeMemoryFromText(buffer, text)` 实现（`src/state.ts`），匹配关键词。检索触发在 `applyDialogue` 内联，不是独立事件。evocation 效果（`memoryMoodDelta` = `evoked.valence × evoked.salience × MEMORY_MOOD_IMPACT`）也在 `applyDialogue` 内联计算并应用到 moodBaseline。
 
-行为倾向必须由历史证据形成，不允许直接写入“温柔”“敏感”等预设人格字段。
+完整的 MemoryEvocationEvent 独立事件化 + MemoryReinforcementEvent + MemoryDecayEvent 属于 M1.4.2 规划。
 
-每次长期变化都应生成 DevelopmentEvent，至少包含：
+#### Memory Engine 设计原则
 
-- 变化对象。
-- 变化前数值。
-- 变化后数值。
-- 使用的算法版本。
-- 证据事件 ID。
-- 置信度。
-- 聚合时间范围。
-- 变化原因说明。
+- 记忆形成 ≠ 记忆强化：形成是一次性事件（MemoryFormationEvent），强化是后续独立事件（待 M1.4.2）。
+- 记忆被检索 ≠ 记忆一定被强化：检索是读操作，产生效果但不自动改变记忆本身。
+- 记忆衰减 ≠ 直接删除历史：衰减降低显著性，硬删除由容量上限（50，FIFO）或显式遗忘事件处理。
+- 原始事件不得被修改：记忆聚合只能生成派生数据，不能改写 DialogueEvent 或 ObservationEvent。
+- 不预置虚构的个人经历（Fresh Start，初始 episodicBuffer=[]）。
+- 记忆生命周期的每个阶段（形成/检索/强化/衰减/遗忘）都应通过独立事件表达（M1.4.1 已确立此原则）。
 
-### 3.7 Habit Formation：习惯形成
+### 3.6 Development Engine（规划中，未实现）
 
-习惯是情景、时间、状态和行为之间反复出现的规律。
+长期发育的协调模块（聚合情景记忆、更新关联、识别重复模式、形成习惯、检测长期漂移）。
 
-例如：
+**当前代码中不存在** DevelopmentEngine 接口、DevelopmentEvent 类型或聚合逻辑。属于阶段六"行为倾向与开放式涌现"的核心前置能力。
 
-多次在深夜、低环境噪声和较低身体负荷下进行舒适交流，可能逐渐形成该时间段更容易发起交流的行为倾向。
+保留的设计意图：
 
-要求：
+- 聚合情景记忆 → 更新动态关联 → 识别重复模式 → 形成/调整习惯 → 检测长期漂移。
+- 每次长期变化生成 DevelopmentEvent，携带证据链和置信度。
+- 行为倾向由历史证据形成，不直接写入预设人格字段。
 
-- 不预设具体习惯。
-- 习惯需要多次证据。
-- 习惯强度可以增强或衰减。
-- 习惯不能直接覆盖当前身体状态。
-- 习惯必须保留形成证据和最近验证时间。
+### 3.7 Habit Formation（规划中，未实现）
 
-### 3.8 Behavioral Policy：行为倾向
+### 3.8 Behavioral Policy（规划中，未实现）
 
-人格以长期行为分布的形式表现，而不是固定标签。
-
-行为选择应综合：
-
-- 当前身体状态。
-- 当前情景。
-- 历史关联。
-- 已形成的习惯。
-- 当前目标（如果存在）。
-- 行为成本。
-- 置信度和不确定性。
-
-候选行为示例：
-
-- 继续交流。
-- 主动发起交流。
-- 安静等待。
-- 请求澄清。
-- 延迟响应。
-- 结束当前交互。
-- 进入恢复状态。
-
-候选行为只是通用动作空间，不是人格定义。
-
-行为策略必须允许探索、修正和不确定性，避免过早锁定单一行为模式。
-
-### 3.9 Self Model：自我模型
-
-Self Model 用于形成可查询的当前自我视图。
-
-```typescript
-interface SelfModel {
-  identityId: string;
-
-  currentBodyState: BodyState;
-
-  behavioralTendencies: Array<{
-    key: string;
-    value: number;
-    confidence: number;
-    evidenceEventIds: string[];
-  }>;
-
-  habits: Array<{
-    id: string;
-    strength: number;
-    confidence: number;
-    evidenceEventIds: string[];
-  }>;
-
-  activeGoals: unknown[];
-  knownUncertainties: unknown[];
-
-  developmentRevision: number;
-  generatedAt: number;
-}
-```
-
-Self Model 是从事件、记忆和发育结果中生成的派生视图，不是可以任意编辑的事实数据库。
-
-它应支持：
-
-- 查询当前状态。
-- 查询过去某个时间点的状态。
-- 查询行为倾向的变化。
-- 查询变化的证据来源。
-- 查询尚未确认的规律。
-- 生成基于历史证据的自我描述。
-
-系统不能通过 LLM 编造自我经历。所有自我描述都必须能回溯到实际事件。
+### 3.9 Self Model（规划中，未实现）
 
 ### 3.10 Identity：身份连续性
 
@@ -554,47 +413,57 @@ Sleep Cycle 不得删除原始事件。整合任务必须幂等，支持失败�
 
 ## 4. 事件溯源与持久化
 
-### 4.1 事件分类
+### 4.1 事件类型（EventType 联合类型）
 
-初期统一使用以下事件类别：
+当前 V2 判别联合类型（`src/events.ts`）共 11 种事件：
 
-| 类别 | 示例 |
-|---|---|
-| WorldEvent | 时间变化、环境变化、传感器输入 |
-| ObservationEvent | 事实提取、输入识别 |
-| BodyEvent | 能量、心境、唤醒变化 |
-| AppraisalEvent | 主观评估结果 |
-| ActionEvent | 主动交流、等待、休息 |
-| OutcomeEvent | 行为后果和状态差异 |
-| MemoryEvent | 情景记忆、关联更新 |
-| DevelopmentEvent | 习惯和行为倾向变化 |
-| LifecycleEvent | 启动、关闭、中断、恢复 |
-| SystemEvent | 配置、版本和迁移记录 |
+| EventType | 职责 | applyEvent 处理函数 | 持久化层列 |
+|---|---|---|---|
+| `genesis` | 身份初始化事件（空状态起步） | `applyGenesis` | ✅ |
+| `tick` | 时间驱动的身体状态自然衰减 | `applyTick` | ✅ |
+| `interruption` | 运行中断及恢复 | `applyInterruption` | ✅ |
+| `environment` | 环境状态变化 | `applyEnvironment` | ✅ |
+| `observation` | 外部输入的客观事实记录 | `applyObservation` | ✅ |
+| `appraisal` | 主观评估结果（多维） | `applyAppraisal` | ✅ |
+| `dialogue` | 对话状态转换（用户输入 + 伴侣输出） | `applyDialogue` | ✅ |
+| `memory_evocation` | （已声明，生产链暂未创建）记忆检索副作用 | `applyMemoryEvocation` | ✅ |
+| `memory_formation` | 记忆正式写入（EpisodicMemory Eventization，M1.4.1） | `applyMemoryFormation` | ✅ |
+| `sleep` | 进入/退出睡眠（自愈状态） | `applySleep` | ✅ |
+| `trait_shift` | 性格特质永久微量漂移 | `applyTraitShiftEvent` | ✅ |
 
-### 4.2 统一事件基础结构
+> **历史设计**：早期架构草案曾使用抽象事件分类（WorldEvent/BodyEvent/ActionEvent/OutcomeEvent/MemoryEvent/DevelopmentEvent/LifecycleEvent/SystemEvent 等），这些分类无法映射到当前 TypeScript 实现的具体事件类型，已废弃。
+
+### 4.2 运行时事件接口 vs 持久化层元数据
+
+**运行时 TypeScript BaseEvent**（`src/events.ts`）— 3 字段极简：
 
 ```typescript
 interface BaseEvent {
-  eventId: string;
-  identityId: string;
-
-  sequence: number;
-  timestamp: number;
-
-  eventType: string;
-  schemaVersion: number;
-
-  causationId?: string;
-  correlationId?: string;
-
-  engineVersion: string;
-  payload: unknown;
-
-  previousEventHash?: string;
+  type: EventType;       // 判别字段（11 种联合）
+  timestamp: string;     // ISO 8601
+  id: string;            // 事件唯一 ID
 }
 ```
 
-实际项目应使用判别联合类型定义具体事件，不应长期使用无约束的 `unknown` 作为业务事件载荷。
+所有具体事件类型（DialogueEvent / MemoryFormationEvent / ObservationEvent 等）继承 BaseEvent + 自身特定 payload。
+
+**持久化层元数据**（PostgreSQL events 表，`migrations/0001_create_events.sql`）— 12 列：
+
+- `sequence BIGSERIAL` — 事件全局唯一顺序（分配序号）
+- `event_id TEXT UNIQUE` — 幂等约束（运行时 BaseEvent.id）
+- `identity_id TEXT` — 身份隔离边界
+- `timestamp TIMESTAMPTZ` — 事件时间
+- `event_type TEXT` — 运行时 BaseEvent.type 的字符串值
+- `schema_version INTEGER` — 1（早期未打版本行）/ 2（M1 起新写入）
+- `engine_version TEXT` — `NULL`（历史）或 `marrow@*`（当前引擎）
+- `causation_id TEXT` / `correlation_id TEXT` — 因果关联（预留，当前未写入）
+- `previous_event_hash TEXT` — 哈希链前驱（链首为 NULL）
+- `event_hash TEXT` — 自身哈希
+- `payload JSONB` — 原始事件完整载荷
+
+**关键区分**：运行时 BaseEvent 没有 `identityId` / `sequence` / `schemaVersion` / `engineVersion` / `previousEventHash` / `eventHash`。这些是存储层附加的元数据，不属于状态转移逻辑。历史设计中曾把 DB 列当作 TypeScript BaseEvent 的属性，这是概念混淆。
+
+> **历史设计**：早期草案曾列出带 10+ 字段的 BaseEvent（包含 eventId/identityId/sequence/eventType/schemaVersion/engineVersion/previousEventHash 等），这些字段混合了运行时接口和持久化层元数据两个层次。当前已分离为上述两层结构。
 
 ### 4.3 持久化原则
 
@@ -677,7 +546,7 @@ PostgreSQL 中已成功提交的事件日志是恢复的唯一历史依据。进
 
 **commit-unknown 处理**：Tick 持久化失败时，整批事件（含全部 event_id、观测确认 ID、时间基准）冻结为 `TickSession.pendingBatch` 原样重试，由 `appendEvents` 的 `ON CONFLICT (event_id)` 幂等吸收——服务端已提交但客户端报错时，重试零新增事件。进程崩溃导致 pendingBatch 丢失 = 该批次未提交，不属于恢复范围（语义正确）。测试：C15（commit-unknown 重试无重复事件）。
 
-**Chat 原子提交**：M1.2.4 起 Chat 的 observation / appraisal / user_input / companion_output 四事件合并为单个 `appendEvents` 批次，与 Tick 同级原子性。历史日志中的部分 Chat 事件（如只有 observation + appraisal）按每条事件独立语义确定性恢复：不伪造缺失事件、不自动补齐对话、不静默跳过，也不报错——观测推进时间轴、appraisal 应用增量，均为确定性操作。
+**Chat 原子提交**：M1.4.1 起 Chat 的 observation / appraisal / user_input / **MemoryFormation（条件化，仅当满足沉淀门槛时）** / companion_output — 四或五事件合并为单个 `appendEvents` 批次，与 Tick 同级原子性。批次组装见 `src/index.ts` handleChatRequest L449-456：条件化 append MemoryFormationEvent 后统一 await appendEvents(batch)。历史日志中的部分 Chat 事件（如 M1.4.1 之前只有 observation + appraisal + user_input + companion_output 的四事件批次，或更早期只有 observation + appraisal）按每条事件独立语义确定性恢复：不伪造缺失事件、不自动补齐对话、不静默跳过，也不报错——观测推进时间轴、appraisal 应用增量，均为确定性操作。DialogueEvent 单独回放不会内联沉淀 EpisodicBuffer（事件化设计），只有存在对应的 MemoryFormationEvent 时才写入记忆。
 
 **Observation 未持久化边界**：ObservationInbox 是进程内存结构。尚未持久化的观测不属于已提交事件日志，进程退出即丢失，Replay 不恢复、也不声称能恢复崩溃前未提交的传感器观测，绝不自动制造虚假历史 Observation。
 
@@ -718,7 +587,7 @@ PostgreSQL 中已成功提交的事件日志是恢复的唯一历史依据。进
 
 ## 6. 当前项目阶段
 
-**当前状态：阶段四与 M0 已完成，V2 架构迁移 M1 进行中（PostgreSQL 持久化 + Fresh Start 初始化）。**
+**当前状态：阶段一至阶段四 + M0 已完成。V2 架构迁移 M1 全部完成。阶段五 M1.4.1 已完成（Episodic Memory Eventization），M1.4.2（记忆生命周期）规划中。**
 
 #### V2 架构迁移里程碑（M0–M1）
 
@@ -729,23 +598,113 @@ PostgreSQL 中已成功提交的事件日志是恢复的唯一历史依据。进
   - [x] M1.2.2：事件链可靠性加固（批量原子提交、观测确认、版本化哈希、RuntimeSession、优雅关闭）
   - [x] M1.2.3：独立只读哈希链验证器
   - [x] M1.2.4：确定性 Replay 与重启恢复（见 4.6）
-- [ ] M1.3：V2 Fresh Start 初始化（全新 identity_id、空记忆与关联网络、genesis 事件、幂等初始化）
-- [ ] M1.4：V2 全新运行验收（实时状态与重启回放一致）
+- [x] M1.3：V2 Fresh Start 初始化（全新 identity_id、空记忆与关联网络、genesis 事件、幂等初始化）
+  - [x] hashString 一次性切换为标准 FNV-1a 32-bit（commit `b6b1485`）
+- [x] M1.4：V2 全新运行验收（实时状态与重启回放一致）
+  - [x] **M1.4.1：Episodic Memory Eventization**（commit `30e340e` + 工作区未提交 3 文件）
+    - [x] 统一 computeEpisodicMemoryCandidate 入口
+    - [x] DialogueEvent 移除隐式记忆写入副作用
+    - [x] MemoryFormationEvent 独立事件化 + applyMemoryFormation
+    - [x] 同批原子写入（Obs→Appr→Dlg→[MemForm]→Comp）
+    - [x] EpisodicMemory 契约补齐（sourceEventId/isTrauma keywords 类型）
+    - [x] Recovery validateMemoryFormationPayload 纯函数 + 11 条约束
+    - [x] M1-M11（222/222 PASS）+ R1-R5（Recovery 真实入口）
+  - [ ] **M1.4.2：Episodic Memory Lifecycle**（规划中，未开始）
 
-M1.3 验收要求：
+M1.3 验收要求（已满足）：
 
-1. PostgreSQL 中不存在任何 V1 历史事件。
-2. V2 使用独立 identity_id。
-3. V2 初始事件序列从空状态开始。
-4. 初始身体状态符合经过确认的初始化参数。
-5. 记忆和关联网络为空。
-6. V2 不读取 V1 JSONL。
-7. V2 能够正常产生第一条事件。
-8. 第一条事件具有正确的 genesis 哈希规则。
-9. 重启后能恢复 V2 自己的状态。
-10. 完整回放结果与实时状态一致。
+1. ✅ PostgreSQL 中不存在任何 V1 历史事件。
+2. ✅ V2 使用独立 identity_id（marrow-v2 / marrow-v2-birth2）。
+3. ✅ V2 初始事件序列从空状态开始。
+4. ✅ 初始身体状态符合经过确认的初始化参数。
+5. ✅ 记忆和关联网络为空。
+6. ✅ V2 不读取 V1 JSONL。
+7. ✅ V2 能够正常产生第一条事件。
+8. ✅ 第一条事件具有正确的 genesis 哈希规则。
+9. ✅ 重启后能恢复 V2 自己的状态。
+10. ✅ 完整回放结果与实时状态一致。
 
-前三阶段已经完成，但进入新架构前必须先审查现有实现，确认原有功能和事件格式。
+M1.4.1 验收记录（已满足）：
+
+| 项 | 结果 |
+|---|---|
+| npm run build | PASS |
+| npm test | 222/222 PASS，0 FAIL |
+| git diff --check | PASS |
+| M1-M11（单元 + applyEvent replay） | 11/11 PASS |
+| R1-R5（Recovery 真实入口） | 5/5 PASS |
+| 生产行为零变化（computeEpisodicMemoryCandidate / applyDialogue / handleChatRequest） | PASS |
+| Recovery 完整契约（11 条约束 + sourceDialogueEventId === sourceEventId 一致性） | PASS |
+| DialogueEvent 不再写 episodicBuffer（M5 / M11 验证） | PASS |
+| MemoryFormationEvent 与其他事件同次 appendEvents 原子写入 | PASS |
+
+当前未提交文件（3 源码 + 1 文档）：
+
+```
+src/events.ts                 — sourceEventId/isTrauma 从可选改为必需（对齐生产行为）
+src/recovery.ts               — validateMemoryFormationPayload() export 纯函数 + keywords 元素类型 + 一致性约束
+src/__tests__/golden-state.test.ts — R1-R5 Recovery 真实入口测试
+Marrow_README_V2.md           — 阶段五 M1.4.1 完成记录 + M1.4.2 规划 + 里程碑列表更新
+```
+
+## 当前架构边界
+
+| 模块 | 职责 |
+|---|---|
+| Observation | 接收外部输入，记录客观事实（source / content / confidence / uncertainty / facts） |
+| Appraisal | 计算输入对当前状态的主观影响（valenceDelta / arousalDelta / energyDelta / trustDelta / needDeltas） |
+| Dialogue | 执行对话状态转换（mood/energy/trust/需求/evocation）。**不再直接写 episodicBuffer** |
+| MemoryFormation | 将符合条件的候选记忆正式写入状态（applyMemoryFormation 只读 event.payload.memory，零重计算） |
+| Recovery | 验证事件契约（validateMemoryFormationPayload 等）并恢复状态（replayPersistedEvents） |
+| Tick | 时间驱动的身体状态自然衰减（mood / arousal / attention / energy） |
+| Interruption | 运行中断及恢复状态（interruption_flag 不可被对话层覆盖） |
+
+核心原则：
+
+- LLM 不直接修改核心状态（mood_baseline / energy / trust 等由 Appraisal Engine 根据当前身体状态独立计算）。
+- 记忆形成是独立事件（MemoryFormationEvent），不是 DialogueEvent 的隐式副作用。
+- 记忆形成必须能够通过事件重放恢复（applyMemoryFormation 零重计算，只读 payload）。
+- 不能仅因为发生了一次对话就默认生成一条记忆（沉淀门槛：intensity≥0.5 且 |weightedMoodDelta + memoryMoodDelta|≥1.0 且 keywords 非空）。
+- 不预置虚构的个人经历（Fresh Start，初始 episodicBuffer=[]）。
+- 不继承 V1 的历史记忆或人格状态（V1 数据只读封存，不参与 V2 运行）。
+- 不引入历史兼容模式（Marrow V2 不以兼容旧版本为设计目标）。
+- 不为了未来可能的需求提前建立复杂抽象（单一入口够用就行）。
+
+## M1.4.2 — Episodic Memory Lifecycle（规划中，未开始）
+
+**目标**：研究并设计记忆形成之后的生命周期。
+
+### 研究问题（七问）
+
+1. **记忆如何被再次访问？** — 检索触发是 evocation（evokeMemoryFromText 已有最小实现）。访问行为本身是状态变化，不是记忆强化。
+2. **重复访问是否会影响记忆强度？** — 强化不等于访问。需要独立的强化事件或衰减机制。
+3. **记忆是否需要随时间衰减？** — 当前 episodicBuffer 只在容量 50 上限时丢弃最旧（FIFO）。是否需要显著性衰减 salience decay？
+4. **记忆之间如何形成关联？** — 当前 EpisodicMemory 只有 sourceEventId 溯源，记忆之间无显式关联。Associations 层是候选位置。
+5. **记忆在什么条件下被遗忘？** — 容量上限 FIFO 是硬遗忘。软遗忘（显著性低于阈值）是否需要？
+6. **记忆的情绪影响与记忆内容是否应该分离？** — 当前 Evocation 效果（memoryMoodDelta）在 applyDialogue 内联计算，与 DialogueEvent 状态转移绑定。是否需要 MemoryEvocationEvent 独立事件化？
+7. **记忆变化是否全部通过独立事件表达？** — 与 M1.4.1 同样的原则：记忆生命周期的每个阶段（形成/检索/强化/衰减/遗忘）都应该是独立事件，可重放。
+
+### 设计原则（初步）
+
+- **记忆形成 ≠ 记忆强化**：形成是一次性事件（MemoryFormationEvent），强化是后续独立事件。
+- **记忆被检索 ≠ 记忆一定被强化**：检索（evocation）是读操作，可以产生效果（mood delta），但不自动改变记忆本身。
+- **记忆衰减 ≠ 直接删除历史**：衰减应该降低显著性，硬删除由容量上限或显式遗忘事件处理。
+- **所有生命周期变化通过事件表达**：与 M1.4.1 架构原则一致，每个变化都有独立事件类型和对应的 applyXxx 函数。
+- **不修改 M1.4.1 的形成门槛和字段规则**：已完成的部分不动。
+- **逐步建立在真实交互产生的记忆上**：不预置记忆，不人为制造经历。
+
+### 预期产出（非承诺，仅规划）
+
+- MemoryEvocationEvent（检索副作用事件化，与 Dialogue 解耦）
+- MemoryReinforcementEvent（显式强化）
+- MemoryDecayEvent / Tick 内的自然衰减（显著性缓慢降低）
+- MemoryForgettingEvent（硬遗忘）
+- Associations 层与 EpisodicMemory 的显式关联（关联权重更新）
+- applyEvent switch 对应 case
+- Recovery 契约校验扩展
+- 测试（与 M1-M11 / R1-R5 同样的覆盖深度）
+
+阶段五暂时不要求完成完整人格涌现，也不要求提前实现复杂目标系统。前三阶段已经完成，但进入新架构前必须先审查现有实现，确认原有功能和事件格式。
 
 ### 阶段一：最小状态机
 
@@ -785,29 +744,89 @@ M1.3 验收要求：
 - 中断状态可以拦截不允许的行为。
 - 原有回放和恢复功能不退化。
 
-### 阶段五：记忆系统与动态关联网络（下一阶段）
+### 阶段五：记忆系统与动态关联网络
 
-目标：
+#### M1.4.1 — EpisodicMemory 事件化（已完成，commit `30e340e` + 未提交工作区 3 文件）
 
-- 建立 Episodic Memory。
-- 建立 Semantic Memory 的最小版本。
-- 建立 Associative Memory。
-- 建立 Experience Outcome。
-- 建立关联权重和置信度。
-- 建立证据来源追踪。
-- 实现记忆检索和时间衰减。
-- 实现基础记忆整合任务。
+**目标**：将 EpisodicMemory 形成从 DialogueEvent 的隐式副作用分离为独立的 MemoryFormationEvent。
 
-验收：
+**完成内容**：
 
-- 一次交互可以形成完整情景记录。
-- 情景记忆能关联原始事件。
-- 相同事件可以在不同上下文形成不同关联。
-- 正负关联可以并存。
-- 单次事件不会直接固化长期行为倾向。
-- 关联更新可重复执行且不会重复计数。
-- 原始事件不会被聚合过程修改。
-- 重启后记忆和关联能够恢复。
+1. **新事件类型 `memory_formation`**（`src/events.ts`）
+   ```typescript
+   interface MemoryFormationEvent extends BaseEvent {
+     type: 'memory_formation';
+     payload: {
+       sourceDialogueEventId: string;  // 追溯触发的 DialogueEvent
+       memory: EpisodicMemory;         // 完整冻结数据
+     };
+   }
+   ```
+
+2. **EpisodicMemory 完整契约**（`src/events.ts`）
+   ```typescript
+   interface EpisodicMemory {
+     id: string;              // 'epi-${dialogueEvent.id}'
+     timestamp: string;       // DialogueEvent.timestamp
+     summary: string;         // text.slice(0, 40)
+     keywords: string[];      // extractKeywords(text) — 必须是非空 string[]
+     valence: number;         // ±0.6
+     salience: number;        // dialogue.intensity
+     sourceEventId: string;   // 恒等于 payload.sourceDialogueEventId
+     isTrauma: boolean;       // action==='insult' && intensity>=0.7
+   }
+   ```
+   注：`sourceEventId` 和 `isTrauma` 从可选改为必需（M1.4.1.1.2 接口收紧，对齐生产行为）。
+
+3. **职责边界**
+   - `DialogueEvent`：只负责 mood/energy/trust/需求/evocation 等状态转移。**不再直接写 episodicBuffer**。
+   - `MemoryFormationEvent`：写入 episodicBuffer。`applyMemoryFormation` 只读 `event.payload.memory`，零重计算，零版本依赖。
+   - 候选计算单一入口 `computeEpisodicMemoryCandidate(state, DialogueEvent, evoked, baseValenceDelta)` 位于 `src/state.ts`。`extractEpisodicMemory` 封装门槛判断 + 构造。`index.ts` handleChatRequest 调用同一实现，无重复公式。
+
+4. **生产批次顺序**（`src/index.ts` L449-456）
+   ```
+   Observation → Appraisal → Dialogue(user_input) → [MemoryFormation] → Dialogue(companion_output)
+   ```
+   - MemoryFormationEvent 仅在满足沉淀门槛时创建。
+   - 五事件（或四事件）在同一次 `appendEvents(batch)` 事务中原子提交。
+   - 内存状态链 `stateAfterObs → stateAfterAppr → stateAfterUser → stateAfterChain(+MemForm?) → finalState(+Comp)` 与事件链顺序完全一致。
+
+5. **沉淀门槛**（不变）
+   ```
+   intensity >= 0.5
+   AND |weightedMoodDelta + memoryMoodDelta| >= 1.0
+   AND extractKeywords(text).length > 0
+   ```
+
+6. **Recovery 契约校验**（`src/recovery.ts`）
+   - 事件白名单包含 `memory_formation`。
+   - `validateMemoryFormationPayload(payload)` export 纯函数（被生产路径 `validateRowForReplay` 和测试共同调用，单一校验入口）。
+   - 完整 11 条约束：payload 是对象 → sourceDialogueEventId 非空 → memory 纯对象 → id/timestamp/summary 非空字符串 → keywords 非空 string[] → valence/salience 有限数值 → sourceEventId 非空字符串 → isTrauma boolean → sourceDialogueEventId === memory.sourceEventId。
+   - 错误消息精确到字段名（fail-closed 风格）。
+
+**架构原则**：
+- 不增加旧版本兼容层。
+- 不增加 legacy 分支或版本回退。
+- 不保留 DialogueEvent 的隐式记忆形成副作用。
+- 不修改记忆形成阈值和字段规则。
+- 历史 DialogueEvent 回放（无 MemoryFormationEvent）→ buffer 保持空。
+
+**测试结果**：M1-M11（单元 + applyEvent 真实 replay）+ R1-R5（recovery 真实入口校验）。总计 222/222 pass，0 fail。
+
+**Git 状态**：
+- `30e340e` — MemoryFormationEvent 基础实现（已提交）
+- 工作区未提交 — `src/events.ts`（sourceEventId/isTrauma 可选→必需）、`src/recovery.ts`（validateMemoryFormationPayload 纯函数 + keywords 类型 + 一致性约束）、`src/__tests__/golden-state.test.ts`（R1-R5）
+
+**验收通过**。M1.4.1.1 关闭。
+
+#### M1.4.2 — 记忆生命周期（下一阶段，未开始）
+
+目标：记忆形成之后，如何经历保留、强化、衰减、关联和遗忘。
+
+设计原则：
+- 逐步建立在真实交互产生的记忆上，不预置记忆或人为制造成长经历。
+- 不修改 EpisodicMemory 形成门槛和字段规则。
+- 不引入不必要的防御性编程。
 
 阶段五暂时不要求完成完整人格涌现，也不要求提前实现复杂目标系统。
 

@@ -22,6 +22,7 @@ import {
   computeEpisodicMemoryCandidate,
   type MarrowState,
 } from '../state.js';
+import { validateMemoryFormationPayload } from '../recovery.js';
 import type {
   DialogueEvent,
   MemoryFormationEvent,
@@ -1070,4 +1071,64 @@ test('[M11] 历史 DialogueEvent 无对应 MemoryFormationEvent → replay 零�
   assert.ok(state.energy < 80, '两次 dialogue → energy 应下降');
 
   console.log(`  [M11 PASS] 历史回放: buffer 空（符合预期）, mood=${state.moodBaseline.toFixed(3)}, energy=${state.energy.toFixed(2)}`);
+});
+
+// ── R1-R4: Recovery 真实入口校验（validateMemoryFormationPayload 生产函数） ──
+// 注：直接调用 recovery.ts export 的纯校验函数，不复制测试专用逻辑
+
+const TS_R = '2026-01-01T00:00:00.000Z';
+
+function buildGoodPayload(srcId: string): Record<string, unknown> {
+  return {
+    sourceDialogueEventId: srcId,
+    memory: {
+      id: `epi-${srcId}`,
+      timestamp: TS_R,
+      summary: '一段温暖的对话记忆',
+      keywords: ['温暖', '感谢'],
+      valence: 0.6,
+      salience: 0.9,
+      sourceEventId: srcId,
+      isTrauma: false,
+    },
+  };
+}
+
+test('[R1] 合法 MemoryFormationEvent payload 通过 recovery 校验', () => {
+  const err = validateMemoryFormationPayload(buildGoodPayload('evt-r1-001'));
+  assert.equal(err, null, `合法 payload 应通过校验，实际: ${err}`);
+  console.log('  [R1 PASS] 合法 payload 通过 recovery 校验');
+});
+
+test('[R2] 缺少 memory.sourceEventId → recovery 拒绝', () => {
+  const p = buildGoodPayload('evt-r2-001');
+  delete (p.memory as Record<string, unknown>).sourceEventId;
+  const err = validateMemoryFormationPayload(p);
+  assert.ok(err && err.includes('sourceEventId'), `应报告 sourceEventId 缺失: ${err}`);
+  console.log(`  [R2 PASS] 缺 sourceEventId 被拒: ${err}`);
+});
+
+test('[R3] memory.isTrauma 类型错误 → recovery 拒绝', () => {
+  const p = buildGoodPayload('evt-r3-001');
+  (p.memory as Record<string, unknown>).isTrauma = 'yes'; // string, not boolean
+  const err = validateMemoryFormationPayload(p);
+  assert.ok(err && err.includes('isTrauma'), `应报告 isTrauma 类型错误: ${err}`);
+  console.log(`  [R3 PASS] isTrauma 类型错误被拒: ${err}`);
+});
+
+test('[R4] sourceDialogueEventId 与 memory.sourceEventId 不一致 → recovery 拒绝', () => {
+  const p = buildGoodPayload('evt-r4-001');
+  p.sourceDialogueEventId = 'evt-r4-001';
+  (p.memory as Record<string, unknown>).sourceEventId = 'evt-different';
+  const err = validateMemoryFormationPayload(p);
+  assert.ok(err && err.includes('不一致'), `应报告不一致: ${err}`);
+  console.log(`  [R4 PASS] ID 不一致被拒: ${err}`);
+});
+
+test('[R5] keywords 数组包含非 string 元素 → recovery 拒绝', () => {
+  const p = buildGoodPayload('evt-r5-001');
+  (p.memory as Record<string, unknown>).keywords = ['hello', 123];
+  const err = validateMemoryFormationPayload(p);
+  assert.ok(err && err.includes('keywords'), `应报告 keywords 类型错误: ${err}`);
+  console.log(`  [R5 PASS] keywords 非 string 元素被拒: ${err}`);
 });

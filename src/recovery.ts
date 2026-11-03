@@ -187,6 +187,34 @@ function isNonEmptyString(value: unknown): value is string {
 }
 
 /**
+ * memory_formation payload 契约校验（纯函数，可测试）。
+ * 返回 null 表示通过，返回 string 表示错误消息。
+ *
+ * 覆盖 EpisodicMemory 完整必需字段 + sourceDialogueEventId 与
+ * memory.sourceEventId 一致性约束。
+ */
+export function validateMemoryFormationPayload(payload: unknown): string | null {
+  if (!isPlainObject(payload)) return 'memory_formation payload 不是对象';
+  const p = payload as Record<string, unknown>;
+  if (!isNonEmptyString(p.sourceDialogueEventId)) return 'memory_formation 缺少 sourceDialogueEventId';
+  const mem = p.memory;
+  if (!isPlainObject(mem)) return 'memory_formation 缺少 payload.memory 对象';
+  if (!isNonEmptyString(mem.id)) return 'memory_formation 缺少 memory.id';
+  if (!isNonEmptyString(mem.timestamp)) return 'memory_formation 缺少 memory.timestamp';
+  if (!isNonEmptyString(mem.summary)) return 'memory_formation 缺少 memory.summary';
+  if (!Array.isArray(mem.keywords) || mem.keywords.length === 0) return 'memory_formation 缺少 memory.keywords';
+  if (!mem.keywords.every((k: unknown) => typeof k === 'string')) return 'memory_formation memory.keywords 包含非 string 元素';
+  if (!isFiniteNumber(mem.valence)) return 'memory_formation 缺少 memory.valence';
+  if (!isFiniteNumber(mem.salience)) return 'memory_formation 缺少 memory.salience';
+  if (!isNonEmptyString(mem.sourceEventId)) return 'memory_formation 缺少 memory.sourceEventId';
+  if (typeof mem.isTrauma !== 'boolean') return 'memory_formation 缺少 memory.isTrauma';
+  if (p.sourceDialogueEventId !== mem.sourceEventId) {
+    return 'memory_formation.sourceDialogueEventId 与 memory.sourceEventId 不一致';
+  }
+  return null;
+}
+
+/**
  * 校验单行事件是否可被确定性 Replay。
  *
  * 通过条件（全部满足）：
@@ -370,22 +398,8 @@ function validateRowForReplay(row: PersistedEventRow): ReplayError | null {
       return null;
 
     case 'memory_formation': {
-      if (!isNonEmptyString(payload.sourceDialogueEventId)) {
-        return fail('invalid_payload', 'memory_formation 缺少 sourceDialogueEventId');
-      }
-      const mem = payload.memory;
-      if (
-        !isPlainObject(mem) ||
-        !isNonEmptyString(mem.id) ||
-        !isNonEmptyString(mem.timestamp) ||
-        !isNonEmptyString(mem.summary) ||
-        !Array.isArray(mem.keywords) ||
-        mem.keywords.length === 0 ||
-        !isFiniteNumber(mem.valence) ||
-        !isFiniteNumber(mem.salience)
-      ) {
-        return fail('invalid_payload', 'memory_formation payload.memory 缺少必要字段');
-      }
+      const err = validateMemoryFormationPayload(payload);
+      if (err) return fail('invalid_payload', err);
       return null;
     }
 

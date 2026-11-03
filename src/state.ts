@@ -336,11 +336,11 @@ function decayAssociations(
  * 而由事件 ID 派生出确定性的伪随机步长——同一事件回放结果完全一致。
  */
 export function hashString(s: string): number {
-  let hash = 0x811c9dc5; // FNV offset basis
-  for (let i = 0; i < s.length; i++) {
-    hash ^= s.charCodeAt(i);
-    // FNV prime 16777619，用位移避免 64 位浮点精度损失
-    hash = (hash * 0x01000193) >>> 0;
+  let hash = 0x811c9dc5; // FNV-1a offset basis (RFC 9923, Informational)
+  const bytes = new TextEncoder().encode(s);
+  for (const byte of bytes) {
+    hash ^= byte;
+    hash = Math.imul(hash, 0x01000193) >>> 0; // FNV prime, 32-bit 整数乘法
   }
   return hash >>> 0;
 }

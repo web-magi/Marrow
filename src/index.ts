@@ -1121,7 +1121,7 @@ async function main(): Promise<void> {
     // 再关闭连接池——顺序反过来会让所有权锁依赖连接池关闭兜底
     await releaseIdentityOwnership(IDENTITY_ID);
     await closeDb();
-    console.log(`Final state: ${formatState(state)}`);
+    console.log(`Final state: ${formatState(currentState!)}`);
     console.log(`Total ticks: ${tickSession.tickCount}`);
     process.exit(0);
   };

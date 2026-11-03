@@ -87,6 +87,13 @@ export const STATE_CONSTANTS = {
   ATTENTION_WALK_STEP: 0.008,
   /** 关联记忆显著性每秒衰减量 */
   ASSOCIATION_SALIENCE_DECAY_PER_SECOND: 0.0005,
+  // === Episodic salience 指数衰减（M1.4.2.1，实验初始值，待真实运行验证） ===
+  /** Episodic 普通记忆 salience 每秒指数衰减率（半衰期 ≈ 30 天，归一化后 = ln(2) / 30days） */
+  EPISODIC_SALIENCE_DECAY_RATE_PER_SECOND: 2.672198e-7,
+  /** trauma 记忆衰减倍率（比普通记忆慢 5 倍 → 半衰期 ≈ 150 天） */
+  EPISODIC_TRAUMA_DECAY_MULTIPLIER: 0.2,
+  /** EpisodicBuffer 容量上限（FIFO 硬淘汰，魔法数字统一为此常量） */
+  EPISODIC_BUFFER_CAPACITY: 50,
   /** 伤痕记忆对 mood 的持续下拉强度系数 */
   SCAR_MOOD_PULL: 0.5,
   /** 语言基础能量消耗（每次对话） */
@@ -324,6 +331,42 @@ function decayAssociations(
     const newSalience = mem.salience - decay;
     if (newSalience > 0.001) {
       next.push({ ...mem, salience: newSalience });
+    }
+  }
+  return next;
+}
+
+/**
+ * decayEpisodicBuffer — Episodic salience 指数衰减（不可变更新）
+ *
+ * 与 Association 的线性衰减不同，Episodic 采用指数衰减：
+ *   salience_next = salience_prev × EXP(-decayRate × deltaSeconds)
+ * 指数衰减天然满足时间分段一致性（t1→t3 一次 tick vs t1→t2→t3 两次 tick
+ * 在数学上严格相等，浮点层面有 <1e-10 级微小误差）。
+ *
+ * Trauma 记忆衰减率 × EPISODIC_TRAUMA_DECAY_MULTIPLIER（默认 0.2），
+ * 即比普通记忆慢 5 倍衰减。
+ *
+ * 不淘汰任何记忆（无阈值淘汰），只降低 salience。淘汰由 FIFO 容量上限处理。
+ *
+ * 不可变要求：返回新数组，每条记忆是新对象（{...mem, salience}）。
+ */
+function decayEpisodicBuffer(
+  buffer: EpisodicMemory[],
+  deltaSeconds: number,
+): EpisodicMemory[] {
+  const c = STATE_CONSTANTS;
+  const normalRate = c.EPISODIC_SALIENCE_DECAY_RATE_PER_SECOND;
+  const traumaMultiplier = c.EPISODIC_TRAUMA_DECAY_MULTIPLIER;
+  const next: EpisodicMemory[] = [];
+  for (const mem of buffer) {
+    const rate = mem.isTrauma ? normalRate * traumaMultiplier : normalRate;
+    const factor = Math.exp(-rate * deltaSeconds);
+    const newSal = Math.max(0, mem.salience * factor);
+    if (newSal === mem.salience) {
+      next.push(mem); // salience 为 0 或 Math.exp(0)=1 时零变化，复用原对象
+    } else {
+      next.push({ ...mem, salience: newSal });
     }
   }
   return next;
@@ -719,6 +762,9 @@ function applyTick(state: MarrowState, event: TickEvent): MarrowState {
   // === associations 衰减 ===
   const newAssociations = decayAssociations(state.associations, delta);
 
+  // === episodic salience 指数衰减（M1.4.2.1，不可变更新） ===
+  const newEpisodicBuffer = decayEpisodicBuffer(state.episodicBuffer, delta);
+
   // === interruption_flag 恢复逻辑 ===
   const newInterruptionFlag =
     state.interruptionFlag &&
@@ -780,6 +826,7 @@ function applyTick(state: MarrowState, event: TickEvent): MarrowState {
     defensiveness: newDefensiveness,
     cognitiveLoad: newCognitiveLoad,
     associations: newAssociations,
+    episodicBuffer: newEpisodicBuffer,
     interruptionFlag: newInterruptionFlag,
     lastBehavior: newBehavior,
     lastUpdated: event.timestamp,
@@ -1280,8 +1327,8 @@ function applyMemoryFormation(
     return state;
   }
   let buffer = [...state.episodicBuffer, mem];
-  if (buffer.length > 50) {
-    buffer = buffer.slice(-50);
+  if (buffer.length > STATE_CONSTANTS.EPISODIC_BUFFER_CAPACITY) {
+    buffer = buffer.slice(-STATE_CONSTANTS.EPISODIC_BUFFER_CAPACITY);
   }
   return {
     ...state,

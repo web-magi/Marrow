@@ -1132,3 +1132,154 @@ test('[R5] keywords 数组包含非 string 元素 → recovery 拒绝', () => {
   assert.ok(err && err.includes('keywords'), `应报告 keywords 类型错误: ${err}`);
   console.log(`  [R5 PASS] keywords 非 string 元素被拒: ${err}`);
 });
+
+// ══════════════════════════════════════════════════════════════════════════
+// M1.4.2.1 — Episodic salience 指数衰减（D1-D5）
+//
+// 目标：验证 EpisodicBuffer 中 salience 随时间自然指数衰减。
+//       不改变记忆形成阈值 / 不新增 EventType / 不修改 applyDialogue。
+// ══════════════════════════════════════════════════════════════════════════
+
+// D1-D5 辅助：构造完整 EpisodicMemory（salience 可控）
+function makeEpisodicMem(overrides: {
+  id?: string; timestamp?: string; summary?: string; keywords?: string[];
+  valence?: number; salience?: number; sourceEventId?: string; isTrauma?: boolean;
+} = {}) {
+  return {
+    id: overrides.id ?? 'epi-001',
+    timestamp: overrides.timestamp ?? TS,
+    summary: overrides.summary ?? '一次温暖的对话',
+    keywords: overrides.keywords ?? ['安慰', '温暖'],
+    valence: overrides.valence ?? 0.6,
+    salience: overrides.salience ?? 0.8,
+    sourceEventId: overrides.sourceEventId ?? 'evt-dialogue',
+    isTrauma: overrides.isTrauma ?? false,
+  };
+}
+
+// D1-D5 辅助：构造 TickEvent
+function makeTickEv(deltaSeconds: number): TickEvent {
+  return {
+    type: 'tick',
+    id: 'evt-tick-d-test',
+    timestamp: '2026-01-02T00:00:00Z',
+    payload: { deltaSeconds },
+  };
+}
+
+// ── D1：指数衰减公式精确验证 ────
+test('[D1] Episodic salience 指数衰减公式精确验证', () => {
+  const c = STATE_CONSTANTS;
+  const mem = makeEpisodicMem({ salience: 0.8 });
+  const initialBuffer = [mem];
+  const state: MarrowState = { ...createInitialState(TS), episodicBuffer: initialBuffer };
+
+  const tick = makeTickEv(3600); // 1 小时
+  const afterTick = applyEvent(state, tick);
+
+  const expected = 0.8 * Math.exp(-c.EPISODIC_SALIENCE_DECAY_RATE_PER_SECOND * 3600);
+  const actual = afterTick.episodicBuffer[0]!.salience;
+  const diff = Math.abs(actual - expected);
+
+  assert.ok(
+    diff < 1e-6,
+    `D1 失败 expected=${expected.toExponential(8)} actual=${actual.toExponential(8)} diff=${diff.toExponential(2)}`,
+  );
+  console.log(`  [D1 PASS] salience=${actual.toExponential(8)} expected=${expected.toExponential(8)} diff=${diff.toExponential(2)}`);
+});
+
+// ── D2：Trauma 记忆衰减 × 0.2 倍率 ────
+test('[D2] Trauma 记忆衰减率 × EPISODIC_TRAUMA_DECAY_MULTIPLIER(0.2)', () => {
+  const c = STATE_CONSTANTS;
+  const memNormal = makeEpisodicMem({ id: 'mem-normal', salience: 0.8, isTrauma: false });
+  const memTrauma = makeEpisodicMem({ id: 'mem-trauma', salience: 0.8, isTrauma: true });
+  const state: MarrowState = { ...createInitialState(TS), episodicBuffer: [memNormal, memTrauma] };
+
+  const afterTick = applyEvent(state, makeTickEv(86400)); // 一天
+
+  const normalSal = afterTick.episodicBuffer[0]!.salience;
+  const traumaSal = afterTick.episodicBuffer[1]!.salience;
+
+  assert.ok(traumaSal > normalSal, `D2 失败 traumaSal=${traumaSal} <= normalSal=${normalSal}`);
+
+  const expectedTrauma = 0.8 * Math.exp(
+    -c.EPISODIC_SALIENCE_DECAY_RATE_PER_SECOND * c.EPISODIC_TRAUMA_DECAY_MULTIPLIER * 86400,
+  );
+  const traumaDiff = Math.abs(traumaSal - expectedTrauma);
+  assert.ok(traumaDiff < 1e-6, `D2 trauma 倍率验证失败 expected=${expectedTrauma.toExponential(8)} actual=${traumaSal.toExponential(8)} diff=${traumaDiff.toExponential(2)}`);
+
+  console.log(`  [D2 PASS] normal=${normalSal.toExponential(6)} trauma=${traumaSal.toExponential(6)} trauma 衰减更慢`);
+});
+
+// ── D3：FIFO 容量常量生效（STATE_CONSTANTS.EPISODIC_BUFFER_CAPACITY = 50） ────
+test('[D3] FIFO 使用 STATE_CONSTANTS.EPISODIC_BUFFER_CAPACITY，魔法数字已消除', () => {
+  const CAP = STATE_CONSTANTS.EPISODIC_BUFFER_CAPACITY;
+  assert.equal(CAP, 50, '常量值应为 50');
+
+  // 构造 50 条记忆（已满）→ 追加第 51 条 → 长度保持 50 → index 0（mem-0）被淘汰
+  const bufferFull = Array.from({ length: CAP }, (_, i) => makeEpisodicMem({ id: `mem-${i}`, salience: 0.8 }));
+  const stateFull: MarrowState = { ...createInitialState(TS), episodicBuffer: bufferFull };
+
+  const newMem: MemoryFormationEvent = {
+    type: 'memory_formation',
+    id: 'evt-memform-d3',
+    timestamp: TS,
+    payload: {
+      sourceDialogueEventId: 'evt-dialogue-d3',
+      memory: makeEpisodicMem({ id: 'mem-newest', salience: 0.8 }),
+    },
+  };
+  const afterForm = applyEvent(stateFull, newMem);
+
+  assert.equal(afterForm.episodicBuffer.length, CAP, `D3 失败 长度=${afterForm.episodicBuffer.length} != CAP=${CAP}`);
+  assert.equal(afterForm.episodicBuffer[0]!.id, 'mem-1', 'D3 失败 mem-0 应被 FIFO 淘汰');
+  assert.equal(afterForm.episodicBuffer[CAP - 1]!.id, 'mem-newest', 'D3 失败 新记忆应在末尾');
+
+  console.log(`  [D3 PASS] FIFO 容量 ${CAP} 生效 mem-0 淘汰 mem-newest 保留在末尾`);
+});
+
+// ── D4：Evocation score 随 Tick 衰减降低 ────
+test('[D4] Evocation score（salience × hitCount）随 Tick 衰减降低', () => {
+  const mem = makeEpisodicMem({ id: 'mem-d4', salience: 0.8, keywords: ['安慰', '上次'] });
+  const stateBefore: MarrowState = { ...createInitialState(TS), episodicBuffer: [mem] };
+
+  const stateAfter = applyEvent(stateBefore, makeTickEv(86400 * 7)); // 一周
+
+  const salBefore = stateBefore.episodicBuffer[0]!.salience;
+  const salAfter = stateAfter.episodicBuffer[0]!.salience;
+
+  assert.ok(salAfter < salBefore, `D4 失败 salAfter=${salAfter} >= salBefore=${salBefore}`);
+
+  console.log(`  [D4 PASS] salience ${salBefore.toExponential(4)} -> ${salAfter.toExponential(6)} evocation score 同步降低`);
+});
+
+// ── D5：Tick 间隔分段一致性（真实 applyTick，非手动 Math.exp） ────
+test('[D5] Tick 间隔分段一致性 一次 3600s vs 36 次 100s（浮点容差 1e-10）', () => {
+  const INITIAL_SAL = 0.8;
+
+  // 方案 A：一次大 Tick（3600s）
+  let stateA: MarrowState = {
+    ...createInitialState(TS),
+    episodicBuffer: [makeEpisodicMem({ id: 'mem-d5', salience: INITIAL_SAL })],
+  };
+  stateA = applyEvent(stateA, makeTickEv(3600));
+  const salA = stateA.episodicBuffer[0]!.salience;
+
+  // 方案 B：36 次小 Tick（每次 100s，总计 3600s）
+  let stateB: MarrowState = {
+    ...createInitialState(TS),
+    episodicBuffer: [makeEpisodicMem({ id: 'mem-d5', salience: INITIAL_SAL })],
+  };
+  for (let i = 0; i < 36; i++) {
+    stateB = applyEvent(stateB, makeTickEv(100));
+  }
+  const salB = stateB.episodicBuffer[0]!.salience;
+
+  const diff = Math.abs(salA - salB);
+  assert.ok(
+    diff < 1e-10,
+    `D5 失败 一次tick=${salA.toExponential(10)} 36次tick=${salB.toExponential(10)} diff=${diff.toExponential(2)}`,
+  );
+
+  console.log(`  [D5 PASS] 一次 3600s=${salA.toExponential(10)} 36x100s=${salB.toExponential(10)} diff=${diff.toExponential(2)}`);
+});

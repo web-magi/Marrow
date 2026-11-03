@@ -293,6 +293,23 @@ interface EpisodicMemory {
 - `MemoryFormationEvent` — 生产批次中的独立事件（与 Obs/Appr/Dlg/Comp 同次 `appendEvents` 原子提交）。
 - `applyMemoryFormation(state, event)` — 只读 `event.payload.memory` 追加到 `episodicBuffer`，零重计算。
 
+**记忆生命周期**（M1.4.2 Sub-Phase 1 已实现，`commit 5e5ebfc`）：
+
+- `decayEpisodicBuffer(buffer, deltaSeconds)` — Tick 内联指数衰减：`salience_next = salience_prev × EXP(-rate × deltaSeconds)`
+- 普通记忆衰减率 ≈ `2.67 × 10^-7 / s`（半衰期 ≈ 30 天），Trauma 记忆 × 0.2（半衰期 ≈ 150 天）
+- `EPISODIC_BUFFER_CAPACITY = 50`（常量，替换魔法数字，FIFO 硬淘汰）
+- `salience` 同时承载检索可访问性（`evokeMemoryFromText` score = `salience × hitCount`）和唤起后状态影响（`memoryMoodDelta = valence × salience × 8`）
+- 不可变更新：返回新数组，元素是 `{ ...mem, salience: newSal }`（零变化时复用原对象）
+- Tick 间隔分段一致性：指数衰减在数学上天然满足 `salience(t1→t3) = salience(t1→t2) × salience(t2→t3)`，浮点层面 < 1e-15 级误差
+
+**已知限制（不影响正确性）**：
+- `evokeMemoryFromText` 只返回 1 条 best（非多条叠加）
+- 关键词子串匹配（非分词 / 向量检索）
+- `MemoryEvocationEvent` 已声明但生产链暂不创建
+- 无 `accessCount` / `lastAccessAt` 字段
+- Association 与 Episodic Memory 无显式关联
+- 无 Semantic Memory / Self Model
+
 **当前未记录的内容**：历史设计中描述的"当时身体状态 / Appraisal 结果 / 系统行为 / 行为持续时间 / 实际后果 / 参与者"等字段，当前 EpisodicMemory 都没有实现。这些是后续 M1.4.2 记忆生命周期可能需要的扩展方向，不属于当前契约。
 
 #### Associative Memory（已实现最小版本）
@@ -318,13 +335,13 @@ interface EpisodicMemory {
 
 当前记忆检索通过 `evokeMemoryFromText(buffer, text)` 实现（`src/state.ts`），匹配关键词。检索触发在 `applyDialogue` 内联，不是独立事件。evocation 效果（`memoryMoodDelta` = `evoked.valence × evoked.salience × MEMORY_MOOD_IMPACT`）也在 `applyDialogue` 内联计算并应用到 moodBaseline。
 
-完整的 MemoryEvocationEvent 独立事件化 + MemoryReinforcementEvent + MemoryDecayEvent 属于 M1.4.2 规划。
+MemoryEvocationEvent 独立事件化、MemoryReinforcementEvent 属于 M1.4.2 Sub-Phase 2+ 暂缓项。MemoryDecay 已在 M1.4.2 Sub-Phase 1 通过 Tick 内联指数衰减实现（不引入独立事件类型）。
 
 #### Memory Engine 设计原则
 
 - 记忆形成 ≠ 记忆强化：形成是一次性事件（MemoryFormationEvent），强化是后续独立事件（待 M1.4.2）。
 - 记忆被检索 ≠ 记忆一定被强化：检索是读操作，产生效果但不自动改变记忆本身。
-- 记忆衰减 ≠ 直接删除历史：衰减降低显著性，硬删除由容量上限（50，FIFO）或显式遗忘事件处理。
+- 记忆衰减 ≠ 直接删除历史：衰减降低显著性（Tick 指数衰减，M1.4.2 Sub-Phase 1 已实现），硬删除由容量上限（50，FIFO）或显式遗忘事件处理。
 - 原始事件不得被修改：记忆聚合只能生成派生数据，不能改写 DialogueEvent 或 ObservationEvent。
 - 不预置虚构的个人经历（Fresh Start，初始 episodicBuffer=[]）。
 - 记忆生命周期的每个阶段（形成/检索/强化/衰减/遗忘）都应通过独立事件表达（M1.4.1 已确立此原则）。
@@ -587,7 +604,7 @@ PostgreSQL 中已成功提交的事件日志是恢复的唯一历史依据。进
 
 ## 6. 当前项目阶段
 
-**当前状态：阶段一至阶段四 + M0 已完成。V2 架构迁移 M1 全部完成。阶段五 M1.4.1 已完成（Episodic Memory Eventization），M1.4.2（记忆生命周期）规划中。**
+**当前状态：阶段一至阶段四 + M0 已完成。V2 架构迁移 M1 全部完成。M1.4.1（Episodic Memory Eventization）已完成；M1.4.2 Sub-Phase 1（Episodic salience 指数衰减）已完成，Sub-Phase 2+ 暂缓，整体 PASS WITH KNOWN LIMITATIONS。**
 
 #### V2 架构迁移里程碑（M0–M1）
 
@@ -609,7 +626,13 @@ PostgreSQL 中已成功提交的事件日志是恢复的唯一历史依据。进
     - [x] EpisodicMemory 契约补齐（sourceEventId/isTrauma keywords 类型）
     - [x] Recovery validateMemoryFormationPayload 纯函数 + 11 条约束
     - [x] M1-M11（222/222 PASS）+ R1-R5（Recovery 真实入口）
-  - [ ] **M1.4.2：Episodic Memory Lifecycle**（规划中，未开始）
+  - [x] **M1.4.2：Episodic Memory Lifecycle**（commit `5e5ebfc`，PASS WITH KNOWN LIMITATIONS）
+    - [x] **Sub-Phase 1：Episodic salience 指数衰减 + FIFO 常量化**（D1-D5, 227/227 PASS）
+      - Tick 驱动指数衰减 `salience × EXP(-rate × deltaSeconds)`，不可变更新
+      - 普通记忆半衰期 ≈ 30 天（rate=2.67e-7/s），Trauma 记忆 ×0.2 倍率 ≈ 150 天
+      - EPISODIC_BUFFER_CAPACITY=50 常量替换魔法数字
+      - salience 衰减同时降低检索可访问性（score=salience×hitCount）和唤起后状态影响（memoryMoodDelta 等）
+    - [ ] Sub-Phase 2+：暂缓（MemoryEvocationEvent 启用 / accessCount 字段 / 多记忆检索 — 需真实运行数据评估）
 
 M1.3 验收要求（已满足）：
 

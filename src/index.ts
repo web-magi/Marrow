@@ -15,7 +15,7 @@
 import { createServer } from 'node:http';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { applyEvent, evokeMemoryFromText, type MarrowState } from './state.js';
+import { applyEvent, evokeMemoryFromText, computeEpisodicMemoryCandidate, type MarrowState } from './state.js';
 import { appendEvents, IDENTITY_ID, generateEventId } from './storage.js';
 import {
   acquireIdentityOwnership,
@@ -55,6 +55,7 @@ import { appraise, type AppraisalContext } from './appraisal.js';
 import { filterCandidateBehavior } from './dialogue.js';
 import type {
   DialogueEvent,
+  MemoryFormationEvent,
   ObservationEvent,
   AppraisalEvent,
 } from './events.js';
@@ -383,8 +384,43 @@ async function handleChatRequest(
     // applyDialogue 应用 mood/energy/trust/需求变化（新格式直接采用 payload.moodDelta）
     const stateAfterUser = applyEvent(stateAfterAppraisal, userEvent);
 
+    // ══════════════════════════════════════════════════════════════════
+    // M1.4.1：EpisodicMemory 事件化 —— 创建 MemoryFormationEvent
+    //
+    // 单一计算入口：computeEpisodicMemoryCandidate(state, event, evoked, baseValence)
+    // 内部封装 weightedMoodDelta + memoryMoodDelta + 沉淀门槛 + 记忆构造
+    // 避免 index.ts 与 state.ts 分别维护同一套公式
+    // ══════════════════════════════════════════════════════════════════
+    const formedMem = computeEpisodicMemoryCandidate(
+      stateAfterAppraisal,
+      userEvent,
+      evoked,
+      userEvent.payload.moodDelta ?? 0,
+    );
+
+    const memoryFormationEvent: MemoryFormationEvent | null = formedMem
+      ? {
+          type: 'memory_formation',
+          id: generateEventId(),
+          timestamp: stamp(),
+          payload: {
+            sourceDialogueEventId: userEvent.id,
+            memory: formedMem,
+          },
+        }
+      : null;
+
+    // 本地内存状态链必须与事件链顺序一致：
+    //   Obs → Appr → User → [MemoryFormation] → Companion
+    // 这样 finalState = applyEvent(applyEvent(stateAfterUser, mem?), companionEvent)
+    // 与回放事件序列逐事件重跑终态完全相同
+    let stateAfterChain: MarrowState = stateAfterUser;
+    if (memoryFormationEvent) {
+      stateAfterChain = applyEvent(stateAfterChain, memoryFormationEvent);
+    }
+
     // 6. 状态机过滤候选行为（interruption_flag 强制拦截）
-    const filterResult = filterCandidateBehavior(stateAfterUser, candidate);
+    const filterResult = filterCandidateBehavior(stateAfterChain, candidate);
 
     // 7. 构建伴侣输出事件（携带候选文本与过滤结果）
     //    伴侣输出不改变自己的 mood（moodDelta=0），只消耗少量 energy
@@ -403,16 +439,21 @@ async function handleChatRequest(
         filterReason: filterResult.filterReason || undefined,
       },
     };
-    const finalState = applyEvent(stateAfterUser, companionEvent);
+    const finalState = applyEvent(stateAfterChain, companionEvent);
 
-    // 8. M1.2.4：四个对话事件在同一事务中原子提交。
-    //    原实现是 4 次独立 appendEvent：中途失败会在事件日志中留下
-    //    不完整的对话（如只有 observation+appraisal），重启恢复时必须
-    //    按部分事件语义处理。单批提交后，「部分 Chat 事件」只能来自
-    //    本改动之前的历史日志，新代码不会再产生。
-    //    本地状态计算（appraise/filter/applyEvent 顺序）完全不变，
-    //    仅持久化边界从 4 次单条变为 1 次批量。
-    await appendEvents([observationEvent, appraisalEvent, userEvent, companionEvent]);
+    // 8. M1.4.1：五事件（或四事件）在同一事务中原子提交。
+    //    memoryFormationEvent 仅在满足沉淀门槛时创建；
+    //    同一批次中 DialogueEvent(user_input) 必须先于 MemoryFormationEvent，
+    //    MemoryFormationEvent 必须先于 DialogueEvent(companion_output)。
+    //    事件序号在 batch 内部由 appendEvents 自动分配。
+    const batch: Array<ObservationEvent | AppraisalEvent | DialogueEvent | MemoryFormationEvent> = [
+      observationEvent,
+      appraisalEvent,
+      userEvent,
+    ];
+    if (memoryFormationEvent) batch.push(memoryFormationEvent);
+    batch.push(companionEvent);
+    await appendEvents(batch);
 
     // 更新全局状态（所有事件均已持久化，内存状态与事件流一致）
     currentState = finalState;

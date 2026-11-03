@@ -28,6 +28,7 @@ import type {
   PersonalityTraits,
   AssociationMemory,
   EpisodicMemory,
+  MemoryFormationEvent,
 } from './events.js';
 import { appraise, type AppraisalContext } from './appraisal.js';
 
@@ -408,6 +409,97 @@ function extractKeywords(text: string, maxTokens = 6): string[] {
     .map((t) => t.trim())
     .filter((t) => t.length >= 2);
   return Array.from(new Set(tokens)).slice(0, maxTokens);
+}
+
+/**
+ * extractEpisodicMemory —— EpisodicMemory 形成门槛判断 + 构造（纯函数）
+ *
+ * 将 applyDialogue 内联的记忆沉淀逻辑封装为独立函数，供两个调用方使用：
+ *   1. index.ts handleChatRequest —— 判断是否创建 MemoryFormationEvent
+ *   2. applyDialogue              —— 保留调用点以便未来状态变化时可恢复
+ *
+ * 门槛（M1.4.1 不调整阈值，与 applyDialogue 旧逻辑完全一致）：
+ *   intensity >= 0.5
+ *   |weightedMoodDelta + memoryMoodDelta| >= 1.0
+ *   extractKeywords(text).length > 0
+ *
+ * 不满足条件返回 null。满足条件返回完整 EpisodicMemory 对象。
+ */
+export function extractEpisodicMemory(
+  event: DialogueEvent,
+  weightedMoodDelta: number,
+  memoryMoodDelta: number,
+): EpisodicMemory | null {
+  const { action, intensity, text } = event.payload;
+  const { id, timestamp } = event;
+  if (action === undefined || intensity === undefined) return null;
+
+  if (
+    intensity >= 0.5 &&
+    Math.abs(weightedMoodDelta + memoryMoodDelta) >= 1.0
+  ) {
+    const keywords = extractKeywords(text);
+    if (keywords.length === 0) return null;
+
+    return {
+      id: `epi-${event.id}`,
+      timestamp,
+      summary: text.slice(0, 40),
+      keywords,
+      valence: weightedMoodDelta + memoryMoodDelta > 0 ? 0.6 : -0.6,
+      salience: intensity,
+      sourceEventId: id,
+      isTrauma: action === 'insult' && intensity >= 0.7,
+    };
+  }
+  return null;
+}
+
+/**
+ * computeEpisodicMemoryCandidate —— EpisodicMemory 完整候选计算（单一入口）
+ *
+ * 封装 weightedMoodDelta + memoryMoodDelta + extractEpisodicMemory 三步
+ * 计算，避免 index.ts 和 state.ts 分别维护同一套公式（M1.4.1.1 修复）。
+ *
+ * 输入：
+ *   state    —— 当前运行时状态（用于 attentionFocus / traits.neuroticism）
+ *   event    —— DialogueEvent（user_input 方向才可能形成记忆）
+ *   evoked   —— evokeMemoryFromText 结果（已由调用方提前检索）
+ *   baseValenceDelta —— 效价增量来源（新格式 = payload.moodDelta；
+ *                        旧格式需重新 appraise——当前生产链只有新格式）
+ *
+ * 输出：满足沉淀门槛 → EpisodicMemory；否则 null。
+ *
+ * 公式（与 applyDialogue 内部 L900-960 完全一致，单一来源）：
+ *   attentionMod  = 0.3 + state.attentionFocus * 0.7
+ *   weightedMoodDelta = baseValenceDelta * attentionMod
+ *                     × (weightedMoodDelta < 0 ? state.traits.neuroticism : 1)
+ *   memoryMoodDelta   = evoked.valence * evoked.salience * 8
+ *                     × (evoked.isTrauma ? 1.5 : 1)
+ */
+export function computeEpisodicMemoryCandidate(
+  state: MarrowState,
+  event: DialogueEvent,
+  evoked: EpisodicMemory | null,
+  baseValenceDelta: number,
+): EpisodicMemory | null {
+  if (event.payload.direction !== 'user_input') return null;
+  const { action, intensity } = event.payload;
+  if (action === undefined || intensity === undefined) return null;
+
+  const attentionMod = 0.3 + state.attentionFocus * 0.7;
+  let weightedMoodDelta = baseValenceDelta * attentionMod;
+  if (weightedMoodDelta < 0) {
+    weightedMoodDelta *= state.traits.neuroticism;
+  }
+
+  let memoryMoodDelta = 0;
+  if (evoked) {
+    memoryMoodDelta = evoked.valence * evoked.salience * STATE_CONSTANTS.MEMORY_MOOD_IMPACT;
+    if (evoked.isTrauma) memoryMoodDelta *= 1.5;
+  }
+
+  return extractEpisodicMemory(event, weightedMoodDelta, memoryMoodDelta);
 }
 
 /**
@@ -982,30 +1074,12 @@ function applyDialogue(
       );
     }
 
-    // 显著对话沉淀为新的情景记忆（发育式记忆，缓冲区分层聚合）
-    let newEpisodicBuffer = state.episodicBuffer;
-    if (
-      intensity >= 0.5 &&
-      Math.abs(weightedMoodDelta + memoryMoodDelta) >= 1.0
-    ) {
-      const mem: EpisodicMemory = {
-        id: `epi-${event.id}`,
-        timestamp: event.timestamp,
-        summary: text.slice(0, 40),
-        keywords: extractKeywords(text),
-        valence: weightedMoodDelta + memoryMoodDelta > 0 ? 0.6 : -0.6,
-        salience: intensity,
-        sourceEventId: event.id,
-        isTrauma: action === 'insult' && intensity >= 0.7,
-      };
-      if (mem.keywords.length > 0) {
-        newEpisodicBuffer = [...state.episodicBuffer, mem];
-        // 限制缓冲区大小，溢出时丢弃最旧的
-        if (newEpisodicBuffer.length > 50) {
-          newEpisodicBuffer = newEpisodicBuffer.slice(-50);
-        }
-      }
-    }
+    // ═══ EpisodicMemory 已迁移为 MemoryFormationEvent（M1.4.1）
+    // DialogueEvent 只负责状态转移（mood/energy/trust/需求/evocation），
+    // 不再直接写入 episodicBuffer。满足沉淀门槛的记忆由 index.ts 创建
+    // 独立 MemoryFormationEvent，在 applyEvent switch 'memory_formation'
+    // 中写入 buffer。历史 DialogueEvent 回放时自然不会产生"新"记忆，
+    // 保持历史含义正确。
 
     return {
       ...state,
@@ -1018,7 +1092,7 @@ function applyDialogue(
       needNovelty: newNeedNovelty,
       needSecurity: newNeedSecurity,
       associations: newAssociations,
-      episodicBuffer: newEpisodicBuffer,
+      episodicBuffer: state.episodicBuffer, // DialogueEvent 不再直接写 buffer
       lastEvokedMemory: evokedSummary,
       lastUpdated: event.timestamp,
     };
@@ -1122,6 +1196,8 @@ export function applyEvent(
       return applyDialogue(state, event);
     case 'memory_evocation':
       return applyMemoryEvocation(state, event);
+    case 'memory_formation':
+      return applyMemoryFormation(state, event);
     case 'sleep':
       return applySleep(state, event);
     case 'trait_shift':
@@ -1178,6 +1254,38 @@ function applyMemoryEvocation(
     energy: newEnergy,
     cognitiveLoad: newCognitiveLoad,
     lastEvokedMemory: summary,
+    lastUpdated: event.timestamp,
+  };
+}
+
+/**
+ * 处理 MemoryFormationEvent —— EpisodicMemory 独立写入（M1.4.1）
+ *
+ * 职责单一：将事件 payload 中冻结的 EpisodicMemory 追加到 episodicBuffer。
+ *   - 不重新计算任何状态转移（mood/energy/trust 等已由对应 DialogueEvent 应用）
+ *   - 不重新判断记忆形成条件（条件在事件写入时已确定并冻结在 payload 中）
+ *   - 容量限制 50，溢出丢弃最旧（与原 applyDialogue 内联逻辑完全一致）
+ *
+ * 设计原则：事件 payload 是真理源。回放时 applyEvent 必须无条件信任
+ * payload.memory 的内容，不能因为当前版本的沉淀门槛变了就"修正"历史记忆。
+ * 这保证了 DialogueEvent 回放和 MemoryFormationEvent 回放互不干扰。
+ */
+function applyMemoryFormation(
+  state: MarrowState,
+  event: MemoryFormationEvent,
+): MarrowState {
+  const mem = event.payload.memory;
+  // 防御性：如果 memory payload 被篡改（缺关键字段），静默拒绝写入
+  if (!mem.id || !mem.keywords || mem.keywords.length === 0) {
+    return state;
+  }
+  let buffer = [...state.episodicBuffer, mem];
+  if (buffer.length > 50) {
+    buffer = buffer.slice(-50);
+  }
+  return {
+    ...state,
+    episodicBuffer: buffer,
     lastUpdated: event.timestamp,
   };
 }

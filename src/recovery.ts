@@ -163,6 +163,7 @@ const KNOWN_EVENT_TYPES: ReadonlySet<string> = new Set<EventType>([
   'environment',
   'dialogue',
   'memory_evocation',
+  'memory_formation',
   'sleep',
   'trait_shift',
   'observation',
@@ -367,6 +368,26 @@ function validateRowForReplay(row: PersistedEventRow): ReplayError | null {
         return fail('invalid_payload', 'memory_evocation 缺少 valence/salience/moodDelta/energyDelta');
       }
       return null;
+
+    case 'memory_formation': {
+      if (!isNonEmptyString(payload.sourceDialogueEventId)) {
+        return fail('invalid_payload', 'memory_formation 缺少 sourceDialogueEventId');
+      }
+      const mem = payload.memory;
+      if (
+        !isPlainObject(mem) ||
+        !isNonEmptyString(mem.id) ||
+        !isNonEmptyString(mem.timestamp) ||
+        !isNonEmptyString(mem.summary) ||
+        !Array.isArray(mem.keywords) ||
+        mem.keywords.length === 0 ||
+        !isFiniteNumber(mem.valence) ||
+        !isFiniteNumber(mem.salience)
+      ) {
+        return fail('invalid_payload', 'memory_formation payload.memory 缺少必要字段');
+      }
+      return null;
+    }
 
     case 'sleep':
       if (typeof payload.entering !== 'boolean') {

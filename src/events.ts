@@ -18,6 +18,7 @@ export type EventType =
   | 'environment'
   | 'dialogue'
   | 'memory_evocation'
+  | 'memory_formation'
   | 'sleep'
   | 'trait_shift'
   | 'observation'
@@ -272,6 +273,7 @@ export type MarrowEvent =
   | EnvironmentEvent
   | DialogueEvent
   | MemoryEvocationEvent
+  | MemoryFormationEvent
   | SleepEvent
   | TraitShiftEvent
   | ObservationEvent
@@ -303,6 +305,33 @@ export interface MemoryEvocationEvent extends BaseEvent {
     moodDelta: number;
     /** 对 energy 的影响量（正向回忆恢复精神） */
     energyDelta: number;
+  };
+}
+
+/**
+ * MemoryFormationEvent —— 记忆形成事件（M1.4.1）
+ *
+ * 独立事件化的 EpisodicMemory 形成。此前 EpisodicMemory 是 DialogueEvent
+ * 的隐式副作用（applyDialogue 内联写入 episodicBuffer），历史事件无法
+ * 追溯、无法独立审计、回放时也无法确认记忆是"当时形成的"还是"后来改
+ * 公式产生的"。
+ *
+ * 现在：每次新形成的 EpisodicMemory 都由独立事件负责写入。
+ *   - DialogueEvent 只负责状态转移（mood/energy/trust），不再直接写 buffer
+ *   - MemoryFormationEvent 携带完整 EpisodicMemory 数据 + 来源 DialogueEvent ID
+ *   - 回放时先跑 DialogueEvent（状态转移），再跑 MemoryFormationEvent（记忆形成）
+ *
+ * 历史事件保护：
+ *   - 旧 DialogueEvent（无对应 MemoryFormationEvent）单独回放 → 不形成新记忆
+ *   - 历史含义保持"当时没有 Event 化的记忆形成"，正确
+ */
+export interface MemoryFormationEvent extends BaseEvent {
+  type: 'memory_formation';
+  payload: {
+    /** 触发本次记忆形成的 DialogueEvent ID */
+    sourceDialogueEventId: string;
+    /** 完整 EpisodicMemory 数据（由确定性规则生成，冻结在事件 payload 中） */
+    memory: EpisodicMemory;
   };
 }
 

@@ -56,69 +56,10 @@ function makeDialogue(partial: Partial<DialogueEvent> & { event_id?: string } = 
   } as unknown as DialogueEvent;
 }
 
-/** 计算 trustMultiplier（直接复用 appraisal.ts 公式） */
-function trustMultiplier(trust: number): number {
-  return trust / 50;
-}
-
-// ══════════════════════════════════════════════════════════════
-// 一、Trust 出生参数
-// ══════════════════════════════════════════════════════════════
-
-test('TRUST_INITIAL 当前值 = 100（TARGET 应为 50）', () => {
-  // ⚠️ TARGET：修改后应为 50
-  console.log('  ⚠️ TARGET 测试：修改后 TRUST_INITIAL 应从 100 变为 50');
-  // 当前值是 100，这里不 assert，只记录，防止当前就失败
-  const current = STATE_CONSTANTS.TRUST_INITIAL;
-  console.log(`    当前值: ${current}, 目标值: 50`);
-  assert.equal(typeof current, 'number');
-});
-
-test('trustMultiplier 计算 — trust=100 → 2.0', () => {
-  assert.equal(trustMultiplier(100), 2.0);
-});
-
-test('trustMultiplier 计算 — trust=50 → 1.0（中性）', () => {
-  assert.equal(trustMultiplier(50), 1.0);
-});
-
-test('trustMultiplier 计算 — trust=0 → 0.0', () => {
-  assert.equal(trustMultiplier(0), 0.0);
-});
-
-test('trustMultiplier 计算 — trust=100 的 actionMood 是 trust=50 的 2 倍', () => {
-  // appraisal.ts L211 公式：actionMood = actionValue × intensity × associationWeight × trustMultiplier
-  const actionValue = 0.8;
-  const intensity = 0.8;
-  const assWeight = 1.0;
-
-  const moodAt100 = actionValue * intensity * assWeight * trustMultiplier(100);
-  const moodAt50 = actionValue * intensity * assWeight * trustMultiplier(50);
-
-  // 用数值近似比较（避免浮点数精度问题）
-  assert.ok(Math.abs(moodAt100 - 2 * moodAt50) < 0.001,
-    `trust=100 actionMood(${moodAt100.toFixed(4)}) 应 = trust=50(${moodAt50.toFixed(4)}) × 2`);
-  assert.ok(Math.abs(moodAt50 - 0.64) < 0.001,
-    `trust=50 actionMood 应 ≈ 0.64`);
-});
-
-test('trustMultiplier 计算 — trust=100 的 arousalDelta 是 trust=50 的 2 倍', () => {
-  // appraisal.ts L251 公式：arousalDelta = |actionValue| × intensity × 15 × trustMultiplier
-  const actionValue = -0.9;
-  const intensity = 1.0;
-  const SCALE = 15;
-
-  const arousalAt100 = Math.abs(actionValue) * intensity * SCALE * trustMultiplier(100);
-  const arousalAt50 = Math.abs(actionValue) * intensity * SCALE * trustMultiplier(50);
-
-  assert.ok(Math.abs(arousalAt100 - 2 * arousalAt50) < 0.001,
-    `trust=100 arousalDelta 应 = trust=50 × 2`);
-});
-
-// ─── actionMood 实际走 appraise()，而不是直接套公式 ───
-
-test('appraise() 实际计算 — trust=100 vs trust=50 的 valenceDelta 比例', () => {
-  const baseContext = {
+/** 构造 appraise() 的最小上下文 */
+function makeAppraisalContext(trust: number, extra: Partial<AppraisalContext> = {}): AppraisalContext {
+  return {
+    trust,
     moodBaseline: 50,
     associationWeight: 1.0,
     defensiveness: 0,
@@ -127,32 +68,104 @@ test('appraise() 实际计算 — trust=100 vs trust=50 的 valenceDelta 比例'
     needNovelty: 30,
     needSecurity: 50,
     evidenceAssociationIds: [],
+    ...extra,
   } as unknown as AppraisalContext;
+}
 
-  const resultAt100 = appraise('compliment', 0.8, { ...baseContext, trust: 100 });
-  const resultAt50 = appraise('compliment', 0.8, { ...baseContext, trust: 50 });
+// ══════════════════════════════════════════════════════════════
+// 一、Trust 出生参数
+// ══════════════════════════════════════════════════════════════
 
-  // 关键验证：trust=100 的 valenceDelta 必须比 trust=50 的大（trustMultiplier 放大）
-  // 但 appraise() 里有 moodDelta 等额外调制，比例不一定严格等于 2:1
+// ─── 真实 appraise() 验证 trust 影响 ───
+// appraisal.ts L163 trustMultiplier = trust/50（局部变量，未导出）
+// 必须通过真实 appraise() 调用验证 trust 对 valenceDelta/arousalDelta 的影响
+
+test('appraise() — trust=100 的 valenceDelta 必须比 trust=50 的大', () => {
+  const resultAt100 = appraise('compliment', 0.8, makeAppraisalContext(100));
+  const resultAt50 = appraise('compliment', 0.8, makeAppraisalContext(50));
+
+  // trust=100 放大 2×，trust=50 中性 1× → valenceDelta 100 应显著大于 50
   assert.ok(resultAt100.valenceDelta > resultAt50.valenceDelta,
     `trust=100 valenceDelta(${resultAt100.valenceDelta.toFixed(3)}) 应 > trust=50(${resultAt50.valenceDelta.toFixed(3)})`);
   console.log(`  valenceDelta(trust=100) = ${resultAt100.valenceDelta.toFixed(3)}`);
   console.log(`  valenceDelta(trust=50)  = ${resultAt50.valenceDelta.toFixed(3)}`);
-  console.log(`  ratio = ${(resultAt100.valenceDelta / resultAt50.valenceDelta).toFixed(2)}`);
 });
 
-test('memoryMoodDelta 完全不经过 trustMultiplier（在 applyDialogue 里）', () => {
-  // state.ts applyDialogue 中，memoryMoodDelta = evoked.valence × evoked.salience × 8
-  // 完全无 trust 参与
-  // 这里直接验证公式：给定 valence 和 salience，值是固定的
-  const MEMORY_MOOD_IMPACT = STATE_CONSTANTS.MEMORY_MOOD_IMPACT; // 8
-  const valence = -0.8;
-  const salience = 0.9;
-  const delta = valence * salience * MEMORY_MOOD_IMPACT;
-  assert.ok(Math.abs(delta - (-5.76)) < 0.001,
-    `memoryMoodDelta ${delta} 应 ≈ -5.76`);
-  // 核心验证：delta 公式里完全没有 trust 变量——memoryMoodDelta 是 trust-independent 的固定值
-  console.log(`  memoryMoodDelta = ${delta}（公式里零 trust 参与，完全 trust-independent）`);
+test('appraise() — trust=100 的 arousalDelta 必须是 trust=50 的 2×（±5% 容差）', () => {
+  const resultAt100 = appraise('compliment', 0.8, makeAppraisalContext(100));
+  const resultAt50 = appraise('compliment', 0.8, makeAppraisalContext(50));
+
+  // arousalDelta = |actionValue| × intensity × 15 × trustMultiplier（L252）
+  // trust=100 → multiplier=2.0, trust=50 → multiplier=1.0 → 严格 2:1
+  const ratio = resultAt100.arousalDelta / resultAt50.arousalDelta;
+  assert.ok(Math.abs(ratio - 2.0) < 0.05,
+    `trust=100 arousalDelta(${resultAt100.arousalDelta.toFixed(3)}) / trust=50(${resultAt50.arousalDelta.toFixed(3)}) = ${ratio.toFixed(3)}, 应 ≈ 2.0`);
+  console.log(`  arousalDelta(trust=100) = ${resultAt100.arousalDelta.toFixed(3)}`);
+  console.log(`  arousalDelta(trust=50)  = ${resultAt50.arousalDelta.toFixed(3)}`);
+  console.log(`  ratio = ${ratio.toFixed(4)}`);
+});
+
+test('appraise() — trust=0 时 arousalDelta 必须为 0（零信任=零唤醒）', () => {
+  const resultAt0 = appraise('compliment', 0.8, makeAppraisalContext(0));
+  const resultAt50 = appraise('compliment', 0.8, makeAppraisalContext(50));
+
+  // trust=0 → multiplier=0 → arousalDelta=0
+  assert.ok(Math.abs(resultAt0.arousalDelta) < 0.001,
+    `trust=0 arousalDelta(${resultAt0.arousalDelta}) 应 ≈ 0`);
+  assert.ok(resultAt50.arousalDelta > 0, 'trust=50 arousalDelta 应 > 0（验证不是全局零）');
+  console.log(`  arousalDelta(trust=0)  = ${resultAt0.arousalDelta.toFixed(3)}`);
+  console.log(`  arousalDelta(trust=50) = ${resultAt50.arousalDelta.toFixed(3)}`);
+});
+
+test('appraise() — 负性行为 trust=100 vs trust=50 的 arousalDelta 同样 2:1', () => {
+  // 侮辱性 action — arousalDelta 取绝对值，正负行为都触发唤醒
+  const resultAt100 = appraise('insult', 0.9, makeAppraisalContext(100));
+  const resultAt50 = appraise('insult', 0.9, makeAppraisalContext(50));
+
+  const ratio = resultAt100.arousalDelta / resultAt50.arousalDelta;
+  assert.ok(Math.abs(ratio - 2.0) < 0.05,
+    `insult trust=100/trust=50 arousalDelta ratio = ${ratio.toFixed(3)}, 应 ≈ 2.0`);
+  console.log(`  insult arousalDelta ratio = ${ratio.toFixed(4)}`);
+});
+
+// ─── memoryMoodDelta 必须完全绕过 trust（state.ts applyDialogue） ───
+// 验证方法：applyEvent 对相同事件，不管 state.trust 是多少，沉淀的 EpisodicMemory 应该完全一致
+// 因为 memoryMoodDelta = evoked.valence × evoked.salience × 8，零 trust 变量
+
+test('applyEvent — 相同事件在 trust=100 vs trust=50 的状态中，沉淀的 EpisodicMemory 完全一致', () => {
+  const stateHighTrust = createInitialState('2026-01-01T00:00:00Z');
+  stateHighTrust.trust = 100;
+
+  const stateLowTrust = createInitialState('2026-01-01T00:00:00Z');
+  stateLowTrust.trust = 50;
+
+  const event = makeDialogue({
+    event_id: 'evt-memory-trust-indep-01',
+    timestamp: '2026-01-01T10:00:00Z',
+    payload: {
+      text: '你简直是天才！我太佩服你了！',
+      action: 'compliment',
+      intensity: 0.95,
+    } as any,
+  });
+  const fullEvent = { ...event } as unknown as MarrowEvent;
+
+  const resultHigh = applyEvent(stateHighTrust, fullEvent);
+  const resultLow = applyEvent(stateLowTrust, fullEvent);
+
+  // EpisodicMemory 应该完全一致 —— memoryMoodDelta 不经过 trustMultiplier
+  assert.equal(resultHigh.episodicBuffer.length, resultLow.episodicBuffer.length);
+  if (resultHigh.episodicBuffer.length > 0) {
+    assert.deepEqual(
+      resultHigh.episodicBuffer[0]!,
+      resultLow.episodicBuffer[0]!,
+      'memoryMoodDelta 必须完全绕过 trust —— 不同 trust 状态沉淀的记忆应相同',
+    );
+    console.log(`  高信任 memory: valence=${resultHigh.episodicBuffer[0]!.valence.toFixed(4)} salience=${resultHigh.episodicBuffer[0]!.salience.toFixed(4)}`);
+    console.log(`  低信任 memory: valence=${resultLow.episodicBuffer[0]!.valence.toFixed(4)} salience=${resultLow.episodicBuffer[0]!.salience.toFixed(4)}`);
+  } else {
+    console.log('  ⚠️ intensity 不够高，未沉淀记忆——本测试需要更强 intensity');
+  }
 });
 
 // ══════════════════════════════════════════════════════════════
@@ -169,12 +182,21 @@ test('createInitialState() — sleepEntryTrust 同步 TRUST_INITIAL', () => {
   assert.equal(s.sleepEntryTrust, STATE_CONSTANTS.TRUST_INITIAL);
 });
 
-test('createInitialState() — trust=100 当前值（TARGET 50）', () => {
+test('createInitialState() — 当前 TRUST_INITIAL 的真实值被记录（本测试记录当前快照，非 TARGET 断言）', () => {
   const s = createInitialState('2026-01-01T00:00:00Z');
-  console.log(`  ⚠️ TARGET 测试：createInitialState().trust 当前=${s.trust}, 目标=50`);
-  assert.equal(typeof s.trust, 'number');
-  assert.ok(s.trust >= 0 && s.trust <= 100);
+  const current = STATE_CONSTANTS.TRUST_INITIAL;
+  console.log(`  当前 TRUST_INITIAL = ${current}, createInitialState().trust = ${s.trust}`);
+  console.log(`  ⚠️ 下一步：生产代码应把 TRUST_INITIAL 从 ${current} 改为 50`);
+  // 当前值快照断言——不是 TARGET，是记录当前真实值
+  assert.equal(s.trust, current, 'createInitialState().trust 必须严格等于 STATE_CONSTANTS.TRUST_INITIAL');
+  assert.equal(sleepEntryTrustOf(s), current, 'sleepEntryTrust 也必须同步等于 TRUST_INITIAL');
 });
+
+/** 辅助：从 state 提取 sleepEntryTrust（createInitialState 里应该有这个字段） */
+function sleepEntryTrustOf(s: MarrowState): number {
+  // state.ts createInitialState 里有 sleepEntryTrust 字段
+  return (s as unknown as { sleepEntryTrust: number }).sleepEntryTrust;
+}
 
 // ══════════════════════════════════════════════════════════════
 // 三、空白记忆状态验证
@@ -185,10 +207,22 @@ test('createInitialState() — associations.length === 0（已正确）', () => 
   assert.equal(s.associations.length, 0);
 });
 
-test('createInitialState() — episodicBuffer.length（TARGET 应为 0）', () => {
+test('createInitialState() — 当前 episodicBuffer 的真实长度被记录（本测试记录当前快照，非 TARGET 断言）', () => {
   const s = createInitialState('2026-01-01T00:00:00Z');
-  console.log(`  ⚠️ TARGET 测试：episodicBuffer 当前长度=${s.episodicBuffer.length}, 目标=0`);
-  assert.ok(s.episodicBuffer.length >= 0);
+  const currentLen = s.episodicBuffer.length;
+  console.log(`  当前 episodicBuffer.length = ${currentLen}`);
+  if (currentLen > 0) {
+    console.log(`  ⚠️ 有 ${currentLen} 条种子记忆，下一步生产代码应删除 SEED_EPISODIC_MEMORIES`);
+    // 记录种子内容，帮助审计
+    for (let i = 0; i < Math.min(currentLen, 3); i++) {
+      const m = s.episodicBuffer[i]!;
+      console.log(`    seed[${i}]: valence=${m.valence.toFixed(2)} salience=${m.salience.toFixed(2)} isTrauma=${(m as any).isTrauma ?? false}`);
+    }
+  } else {
+    console.log('  ✅ 出生状态已是空记忆，无需修改');
+  }
+  // 真实断言：episodicBuffer 必须是数组（至少结构正确）
+  assert.ok(Array.isArray(s.episodicBuffer), 'episodicBuffer 必须是数组');
 });
 
 test('evokeMemoryFromText — 空 buffer 返回 null（基线）', () => {

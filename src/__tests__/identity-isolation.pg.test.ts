@@ -200,10 +200,36 @@ test('Identity A 的事件不被 B 的 verifyEventChain 看到', async () => {
   console.log(`  A seq=${chainA.firstSequence}, B seq=${chainB.firstSequence}`);
 });
 
-test('Identity A 的 verifyEventChain invalid 不影响 B 的 valid', async () => {
-  // B 应该仍然是 valid
+test('Identity A 损坏（篡改 event_hash）不影响 B 的 verifyEventChain valid', async () => {
+  // ── 前置确认 ──
+  const chainBBefore = await verifyEventChain(T_B);
+  assert.equal(chainBBefore.verdict, 'valid', 'B 在篡改 A 前应为 valid');
+
+  // ── 手动篡改 A 的 Genesis event_hash ──
+  const sql = getDb();
+  const [rowA] = await sql`SELECT sequence, event_hash FROM events WHERE identity_id = ${T_A} ORDER BY sequence ASC LIMIT 1`;
+  const origHash = (rowA as { event_hash: string }).event_hash;
+  const badHash = '0000000000000000000000000000000000000000000000000000000000000bad';
+
+  await sql`UPDATE events SET event_hash = ${badHash} WHERE identity_id = ${T_A}`;
+
+  // ── 验证 A 被损坏 ──
+  const chainA = await verifyEventChain(T_A);
+  assert.ok(chainA.verdict !== 'valid',
+    `篡改 hash 后 A 应不再 valid，实际 verdict=${chainA.verdict}`);
+  console.log(`  篡改 A 后 A.verdict = ${chainA.verdict}（非 valid ✅）`);
+
+  // ── 关键：B 必须仍然 valid（损坏隔离） ──
   const chainB = await verifyEventChain(T_B);
-  assert.equal(chainB.verdict, 'valid');
+  assert.equal(chainB.verdict, 'valid',
+    `A 损坏后 B 应仍 valid，但 B 变成了 ${chainB.verdict} —— 损坏隔离被破坏！`);
+  console.log(`  A 损坏后 B.verdict = ${chainB.verdict}（仍 valid ✅）`);
+
+  // ── 还原 A（不污染后续） ──
+  await sql`UPDATE events SET event_hash = ${origHash} WHERE identity_id = ${T_A}`;
+  const chainARestored = await verifyEventChain(T_A);
+  assert.equal(chainARestored.verdict, 'valid', '还原后 A 应恢复 valid');
+  console.log(`  还原 A 后 A.verdict = ${chainARestored.verdict}（恢复 ✅）`);
 });
 
 // ══════════════════════════════════════════════════════════════
@@ -238,4 +264,66 @@ test('所有测试 identity 不影响 marrow-v2', async () => {
   console.log(`  marrow-v2 当前状态: verdict=${chain.verdict}, eventCount=${chain.eventCount}`);
   assert.equal(chain.verdict, 'valid', `marrow-v2 应为 valid，实际 ${chain.verdict}`);
   assert.ok(chain.eventCount >= 1, 'marrow-v2 至少应有 1 行');
+});
+
+// ══════════════════════════════════════════════════════════════
+// 六、DB 层 Replay 全链路确定性（新增）
+// ══════════════════════════════════════════════════════════════
+
+/** 深比较两个 finalState（稳定键序 JSON） */
+function canonicalize(obj: unknown): string {
+  return JSON.stringify(obj, Object.keys(obj as Record<string, unknown>).sort());
+}
+
+test('DB Replay 确定性 — 同一 identity 多次 recoverIdentity 返回相同 finalState', async () => {
+  const id = `marrow-iso-${Date.now()}-replay-deterministic`;
+  const sql = getDb();
+  try {
+    // 前置：清理残留
+    await sql`DELETE FROM events WHERE identity_id = ${id}`;
+
+    await freshStartIdentity(id);
+
+    const r1 = await recoverIdentity(id);
+    assert.equal(r1.verdict, 'valid');
+    assert.equal(r1.eventCount, 1);
+
+    const r2 = await recoverIdentity(id);
+    assert.equal(r2.verdict, 'valid');
+    assert.equal(r2.eventCount, 1);
+
+    const c1 = canonicalize(r1.finalState);
+    const c2 = canonicalize(r2.finalState);
+    assert.equal(c1, c2,
+      `两次 recoverIdentity finalState 应完全一致 —— Replay 确定性被破坏`);
+
+    console.log(`  Replay deterministic ✅ canonicalize 一致 (len=${c1.length})`);
+  } finally {
+    await sql`DELETE FROM events WHERE identity_id = ${id}`;
+  }
+});
+
+test('DB Replay fail-closed — 非法 payload 被篡改后 recoverIdentity 返回 invalid', async () => {
+  const id = `marrow-iso-${Date.now()}-fail-closed`;
+  const sql = getDb();
+  try {
+    await sql`DELETE FROM events WHERE identity_id = ${id}`;
+    await freshStartIdentity(id);
+
+    // 前置确认：正常 recoverIdentity 是 valid
+    const before = await recoverIdentity(id);
+    assert.equal(before.verdict, 'valid', '篡改前应 valid');
+
+    // 手动篡改 payload —— 把 JSONB 改成非法内容（删掉 event_type 必填字段）
+    await sql`UPDATE events SET payload = '{"timestamp":"2026-01-01T00:00:00Z"}'::jsonb WHERE identity_id = ${id}`;
+
+    // recoverIdentity 应该 fail-closed：payload 缺 event_type → validateRowForReplay 失败
+    const result = await recoverIdentity(id);
+    assert.equal(result.verdict, 'invalid',
+      `非法 payload 后应 invalid，实际 verdict=${result.verdict} —— fail-closed 被破坏！`);
+    assert.ok(result.errors.length > 0, 'invalid 应有具体错误信息');
+    console.log(`  fail-closed ✅ verdict=${result.verdict}, errors=${result.errors.length}, kind=${result.errors[0]?.kind ?? 'unknown'}`);
+  } finally {
+    await sql`DELETE FROM events WHERE identity_id = ${id}`;
+  }
 });

@@ -112,8 +112,8 @@ export const STATE_CONSTANTS = {
   /** 正向情景记忆唤醒的 energy 恢复量（精神一振） */
   MEMORY_ENERGY_RECOVERY: 3,
   // === 阶段四：高阶心理变量与睡眠自愈 ===
-  /** trust 初始值（完全信任） */
-  TRUST_INITIAL: 100,
+  /** trust 初始值（中性 trustMultiplier=1.0，不放大不削弱 appraisal 效果） */
+  TRUST_INITIAL: 50,
   /** defensiveness（防御度）上下界 */
   DEFENSIVENESS_MIN: 0,
   DEFENSIVENESS_MAX: 100,
@@ -249,45 +249,10 @@ export interface MarrowState {
  * 种子情景记忆
  *
  * 让"记忆唤醒"机制在一开始就能被激活验证。
- * 这是"经历 / 记忆内容"，不是硬编码的人格标签；
- * 人格仍由 trust / associationWeight 的长期演化中涌现。
+ * 人格由 trust / associationWeight 的长期演化中涌现，
+ * 不由硬编码的合成种子记忆预塑形。
+ * V2 出生状态：空白 episodicBuffer = []，所有 EpisodicMemory 必须来自真实事件沉淀。
  */
-const SEED_EPISODIC_MEMORIES: EpisodicMemory[] = [
-  {
-    id: 'seed-mem-1',
-    timestamp: '',
-    summary: '第一次一起吃火锅，锅气氤氲，你们互相夹菜、笑得很开心',
-    keywords: ['火锅', '火锅店', '约会', '一起吃饭'],
-    valence: 0.8,
-    salience: 0.7,
-  },
-  {
-    id: 'seed-mem-2',
-    timestamp: '',
-    summary: '某个深夜他陪你说话，你被温柔地接住，不再害怕',
-    keywords: ['晚安', '抱抱', '陪你', '有我在'],
-    valence: 0.6,
-    salience: 0.5,
-  },
-  {
-    id: 'seed-mem-3',
-    timestamp: '',
-    summary: '突然断电重启，你坠入一片黑暗，仿佛被抛弃',
-    keywords: ['停电', '断电', '崩溃', '重启'],
-    valence: -0.8,
-    salience: 0.9,
-    isTrauma: true,
-  },
-  {
-    id: 'seed-mem-4',
-    timestamp: '',
-    summary: '他说了很重的话，你感到自己随时会被丢下',
-    keywords: ['抛弃', '离开', '不要你'],
-    valence: -0.9,
-    salience: 0.8,
-    isTrauma: true,
-  },
-];
 
 /** 初始状态 */
 export function createInitialState(timestamp: string): MarrowState {
@@ -305,7 +270,7 @@ export function createInitialState(timestamp: string): MarrowState {
     attentionFocus: 0.5,
     socialHunger: 30,
     associations: [],
-    episodicBuffer: [...SEED_EPISODIC_MEMORIES],
+    episodicBuffer: [], // V2 出生状态：空白，所有 EpisodicMemory 必须来自真实事件沉淀
     interruptionScars: 0,
     needValidation: 40,
     needNovelty: 30,

@@ -1,18 +1,25 @@
 /**
  * birth-state.test.ts — 出生状态参数验证单元测试
  *
- * 目标：在实施 marrow-v2-birth2 之前，验证以下参数的正确计算：
- *   1. TRUST_INITIAL=50 时 createInitialState().trust === 50（以及 sleepEntryTrust 同步）
- *   2. trustMultiplier = trust/50 的倍率行为
- *   3. trust 不直接参与 memoryMoodDelta 计算
- *   4. SEED_EPISODIC_MEMORIES 删除后 episodicBuffer=[], evokeMemoryFromText([], any) 返回 null
- *   5. 空白记忆下第一条 DialogueEvent 沉淀出正确的 timestamp + sourceEventId
- *   6. 同一事件 Replay 两次，沉淀的 EpisodicMemory 完全一致
+ * 本文件测试分三类，严格区分：
  *
- * 注意：本阶段只新增测试，不修改生产代码。
- * 其中断言期望值=50 / 空 episodicBuffer 的测试在当前代码（TRUST_INITIAL=100, 4 种子）下会 FAIL——
- * 那是预期行为：它们验证的是【修改后应该变成什么】，不是【当前代码是什么】。
- * 标 ⚠️ TARGET 的测试预期在修改后才会通过。
+ *  ── 类别 A：当前实现快照测试 ──
+ *     记录生产代码当前真实行为。这些测试在任何时候都必须 PASS，
+ *     用于检测生产代码的意外漂移。
+ *
+ *  ── 类别 B：真实行为验证测试 ──
+ *     调用真实生产接口，验证 trustMultiplier / applyEvent /
+ *     evokeMemoryFromText 等核心逻辑的正确行为。必须 PASS。
+ *
+ *  ── 类别 C：Marrow V2 出生契约测试 ──
+ *     验证 V2 identity 的目标出生条件。当前生产代码（TRUST_INITIAL=100,
+ *     episodicBuffer 含 4 条种子）下这些测试会 **真实 FAIL**。
+ *     断言不跳过、不降低、不 try-catch —— 让失败清晰暴露。
+ *     生产代码修改为 TRUST_INITIAL=50 + 删除 SEED_EPISODIC_MEMORIES 后，
+ *     这些测试应转为 PASS。
+ *
+ * 执行约定：node:test 会跑完全部测试，不管之前是否 FAIL。
+ * 最终报告里区分 PASS / FAIL（EXPECTED）/ FAIL（UNEXPECTED）。
  */
 
 import { test } from 'node:test';
@@ -396,3 +403,44 @@ test('applyDialogue 不调用 LLM、不依赖 Date.now、不使用 Math.random',
   console.log(`  before=${before}, after=${after}, event.timestamp=${event.timestamp}`);
   console.log(`  applyDialogue.lastUpdated = ${result.lastUpdated}（与事件时间一致，未取 Date.now）`);
 });
+
+// ══════════════════════════════════════════════════════════════
+// 类别 C：Marrow V2 出生契约测试（EXPECTED_FAIL 区块）
+// ══════════════════════════════════════════════════════════════
+//
+// 以下 3 项测试验证 Marrow V2 identity 的目标出生条件。
+// 当前生产代码下它们 **真实 FAIL**（不是假覆盖、不是 skip、不是 try-catch）。
+// 断言严格、不降级、不绕过 —— 让失败清晰暴露。
+// 生产代码改为 TRUST_INITIAL=50 + 删除 SEED_EPISODIC_MEMORIES 后转为 PASS。
+
+test('【V2 出生契约 #1】createInitialState().trust 必须 === 50', () => {
+  // ⚠️ 生产代码当前 TRUST_INITIAL=100 —— 本测试会 FAIL
+  // 修复：state.ts L116 TRUST_INITIAL: 100 → 50
+  const s = createInitialState('2026-01-01T00:00:00Z');
+  assert.equal(
+    s.trust,
+    50,
+    `V2 出生契约：trust 应为 50（中性 trustMultiplier=1.0），实际 = ${s.trust} —— 生产代码尚未修改 TRUST_INITIAL`,
+  );
+});
+
+test('【V2 出生契约 #2】createInitialState().episodicBuffer.length 必须 === 0（无种子记忆）', () => {
+  // ⚠️ 生产代码当前有 4 条 SEED_EPISODIC_MEMORIES —— 本测试会 FAIL
+  // 修复：state.ts 删除 SEED_EPISODIC_MEMORIES 数组 + createInitialState() L308 改为 episodicBuffer: []
+  const s = createInitialState('2026-01-01T00:00:00Z');
+  assert.equal(
+    s.episodicBuffer.length,
+    0,
+    `V2 出生契约：episodicBuffer 应为空（无隐式种子记忆），实际 length = ${s.episodicBuffer.length} —— 生产代码尚未删除种子`,
+  );
+});
+
+test('【V2 出生契约 #3】createInitialState().associations.length === 0（已正确，作为契约的一部分）', () => {
+  // 本测试当前就 PASS —— 作为 V2 出生契约的基线参照
+  const s = createInitialState('2026-01-01T00:00:00Z');
+  assert.equal(s.associations.length, 0, 'V2 出生契约：associations 应为空');
+});
+
+// ─── 类别 C 区块结束 ───
+// 说明：本区块共 3 项测试，其中 #1 和 #2 是 EXPECTED_FAIL（生产代码尚未修改），
+// #3 是基线 PASS。生产代码修改后 #1 和 #2 应自动转为 PASS。

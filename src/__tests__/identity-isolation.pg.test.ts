@@ -13,14 +13,20 @@
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import type { MarrowEvent } from '../events.js';
 import { getDb, closeDb } from '../db/connection.js';
-import { IDENTITY_ID } from '../storage.js';
+import {
+  loadEventRows,
+  appendEvents,
+  type PersistedEventRow,
+} from '../storage.js';
 import { verifyEventChain } from '../verify-chain.js';
 import {
   acquireIdentityOwnership,
   releaseIdentityOwnership,
   freshStartIdentity,
   recoverIdentity,
+  replayPersistedEvents,
 } from '../recovery.js';
 import { getRuntimeSession } from '../runtime-session.js';
 
@@ -257,13 +263,15 @@ test('Identity A / B / C — 各自 recoverIdentity 独立返回不同 finalStat
 // 五、marrow-v2 不受测试 identity 影响
 // ══════════════════════════════════════════════════════════════
 
-test('所有测试 identity 不影响 marrow-v2', async () => {
-  // marrow-v2 当前状态：1 行 Genesis（seq=29840）
-  // 验证它仍然是 valid，eventCount 仍然是 1
-  const chain = await verifyEventChain(IDENTITY_ID);
-  console.log(`  marrow-v2 当前状态: verdict=${chain.verdict}, eventCount=${chain.eventCount}`);
-  assert.equal(chain.verdict, 'valid', `marrow-v2 应为 valid，实际 ${chain.verdict}`);
-  assert.ok(chain.eventCount >= 1, 'marrow-v2 至少应有 1 行');
+test('旧生产 identity marrow-v2 保持不变（不受任何测试影响）', async () => {
+  // 硬编码旧 identity 名称（不是动态 IDENTITY_ID）
+  // marrow-v2 应该在 DB 里保持 valid + eventCount >= 1，
+  // 不管生产代码 IDENTITY_ID 换成什么新值
+  const OLD_ID = 'marrow-v2';
+  const chain = await verifyEventChain(OLD_ID);
+  console.log(`  marrow-v2（旧生产 identity）当前状态: verdict=${chain.verdict}, eventCount=${chain.eventCount}`);
+  assert.equal(chain.verdict, 'valid', `marrow-v2 应为 valid，实际 ${chain.verdict} —— 旧 identity 被破坏！`);
+  assert.ok(chain.eventCount >= 1, 'marrow-v2 至少应有 1 行 Genesis');
 });
 
 // ══════════════════════════════════════════════════════════════
@@ -323,6 +331,173 @@ test('DB Replay fail-closed — 非法 payload 被篡改后 recoverIdentity 返�
       `非法 payload 后应 invalid，实际 verdict=${result.verdict} —— fail-closed 被破坏！`);
     assert.ok(result.errors.length > 0, 'invalid 应有具体错误信息');
     console.log(`  fail-closed ✅ verdict=${result.verdict}, errors=${result.errors.length}, kind=${result.errors[0]?.kind ?? 'unknown'}`);
+  } finally {
+    await sql`DELETE FROM events WHERE identity_id = ${id}`;
+  }
+});
+
+// ─── 真实 Payload 校验器独立测试（Task 二：绕过 DB hash 链） ───
+// 关键发现：computeEventHash 把完整 event（含 payload 所有字段）做 SHA-256
+// 所以不可能同时满足「hash 有效 + payload 非法」——改 payload 就会改 hash
+// 解决方案：绕开 DB 层 + verifyEventChain，直接构造 PersistedEventRow 数组
+// 喂给 replayPersistedEvents，让它内部的 validateRowForReplay 被触发
+
+test('【Payload 校验器独立】validateRowForReplay 拒绝缺 moodDelta/salience 的 dialogue payload', async () => {
+  const id = `marrow-iso-${Date.now()}-payload-only`;
+  const sql = getDb();
+  try {
+    await sql`DELETE FROM events WHERE identity_id = ${id}`;
+    await freshStartIdentity(id);
+
+    // 1. loadEventRows 拿合法 genesis row（hash 链有效）
+    const rows = await loadEventRows(id);
+    assert.equal(rows.length, 1, 'Fresh Start 后应有 1 行 genesis');
+    const genesisRow = rows[0]!;
+
+    // 2. 构造非法 dialogue PersistedEventRow —— payload 缺 moodDelta 和 salience
+    //    validateRowForReplay 对 dialogue 要求 direction + text + moodDelta + salience 全为 finite number
+    const badRow: PersistedEventRow = {
+      sequence: String(parseInt(genesisRow.sequence, 10) + 1),
+      event_id: 'evt-bad-dialogue-001',
+      identity_id: id,
+      timestamp: '2026-01-01T10:00:00Z',
+      event_type: 'dialogue',
+      schema_version: genesisRow.schema_version,
+      engine_version: genesisRow.engine_version,
+      causation_id: null,
+      correlation_id: null,
+      previous_event_hash: genesisRow.event_hash,
+      event_hash: '0000000000000000000000000000000000000000000000000000000000000000', // 假 hash，replayPersistedEvents 不检查链 hash
+      payload: {
+        type: 'dialogue',
+        id: 'evt-bad-dialogue-001',
+        event_id: 'evt-bad-dialogue-001',
+        identity_id: id,
+        previous_event_hash: genesisRow.event_hash,
+        event_hash: '0000000000000000000000000000000000000000000000000000000000000000',
+        schema_version: genesisRow.schema_version,
+        engine_version: genesisRow.engine_version,
+        timestamp: '2026-01-01T10:00:00Z',
+        payload: {
+          text: '你好',
+          direction: 'user_input',
+          // ❌ 故意缺 moodDelta 和 salience —— validateRowForReplay 应该拒绝
+          // dialogue 还缺 action / intensity，但那是 applyEvent 内部可选，validateRowForReplay 不检查
+        } as unknown as Record<string, unknown>,
+      } as unknown as MarrowEvent,
+    };
+
+    // 3. 直接调用 replayPersistedEvents —— 它内部 L566 调 validateRowForReplay
+    //    返回 invalid，errors[0].kind 应该是 'invalid_payload'（不是 'chain_verification_failed'）
+    const result = replayPersistedEvents(id, [genesisRow, badRow]);
+
+    assert.equal(result.verdict, 'invalid',
+      `缺 moodDelta/salience 后应 invalid，实际 verdict=${result.verdict} —— Payload 校验器被绕过！`);
+    assert.ok(result.errors.length > 0, '应有具体错误信息');
+
+    // 关键断言：错误类型来自 validateRowForReplay 的 payload 校验路径
+    assert.equal(result.errors[0]!.kind, 'invalid_payload',
+      `错误类型应为 invalid_payload（来自 validateRowForReplay 的 dialogue 字段校验），实际 kind=${result.errors[0]!.kind}`);
+    console.log(`  Payload 校验器独立测试 ✅ verdict=${result.verdict}, kind=${result.errors[0]!.kind}`);
+    console.log(`    message=${result.errors[0]!.message}`);
+  } finally {
+    await sql`DELETE FROM events WHERE identity_id = ${id}`;
+  }
+});
+
+// ─── 多事件 Replay 全链路确定性（Task 三） ───
+// 用真实生产写入路径 appendEvents 构造 Genesis → A → B → C 链
+
+test('多事件链 Replay 确定性 — appendEvents(A,B,C) + recoverIdentity 结果一致', async () => {
+  const id = `marrow-iso-${Date.now()}-multi-events`;
+  const sql = getDb();
+  try {
+    await sql`DELETE FROM events WHERE identity_id = ${id}`;
+    await freshStartIdentity(id);
+
+    // 1. 用真实生产写入路径 appendEvents 追加 3 条 DialogueEvent
+    //    timestamp 必须晚于 Genesis（freshStart 写入的是当前时间），否则触发 timestamp_regression
+    const baseTs = new Date(Date.now() + 60_000).toISOString(); // 基准：Genesis 之后 1 分钟
+    const events: MarrowEvent[] = [
+      {
+        type: 'dialogue',
+        id: 'evt-multi-a',
+        identity_id: id,
+        timestamp: baseTs,
+        payload: {
+          text: '你好，今天天气不错',
+          direction: 'user_input',
+          moodDelta: 0.3,
+          salience: 0.5,
+          action: 'compliment',
+          intensity: 0.6,
+        },
+      },
+      {
+        type: 'dialogue',
+        id: 'evt-multi-b',
+        identity_id: id,
+        timestamp: new Date(Date.now() + 120_000).toISOString(),
+        payload: {
+          text: '你真的很棒！我很欣赏你',
+          direction: 'user_input',
+          moodDelta: 0.8,
+          salience: 0.9,
+          action: 'compliment',
+          intensity: 0.95,
+        },
+      },
+      {
+        type: 'dialogue',
+        id: 'evt-multi-c',
+        identity_id: id,
+        timestamp: new Date(Date.now() + 180_000).toISOString(),
+        payload: {
+          text: '哦天呐，你怎么这么笨',
+          direction: 'user_input',
+          moodDelta: -0.9,
+          salience: 0.85,
+          action: 'insult',
+          intensity: 0.9,
+        },
+      },
+    ] as unknown as MarrowEvent[];
+
+    await appendEvents(events, { identityId: id });
+
+    // 2. 验证链结构正确（4 行 = Genesis + 3 Dialogue）
+    const rows = await loadEventRows(id);
+    assert.equal(rows.length, 4, `应有 4 行事件（Genesis+3Dialogue），实际 ${rows.length}`);
+
+    // 3. recoverIdentity —— 真实走 DB → SELECT → replayPersistedEvents → canonicalize finalState
+    const r1 = await recoverIdentity(id);
+    console.log(`  recoverIdentity verdict=${r1.verdict}, eventCount=${r1.eventCount}, errors=${JSON.stringify(r1.errors).slice(0, 500)}`);
+    if (r1.errors.length > 0) {
+      for (const err of r1.errors) {
+        console.log(`    error kind=${err.kind}, message=${err.message}`);
+      }
+    }
+    assert.equal(r1.verdict, 'valid', '多事件链 recoverIdentity 应 valid');
+    assert.equal(r1.eventCount, 4);
+
+    // 4. 重复 recoverIdentity —— 幂等性
+    const r2 = await recoverIdentity(id);
+    assert.equal(r2.verdict, 'valid');
+    assert.equal(r2.eventCount, 4);
+
+    const c1 = canonicalize(r1.finalState);
+    const c2 = canonicalize(r2.finalState);
+    assert.equal(c1, c2,
+      `多事件链两次 recoverIdentity finalState 应完全一致`);
+
+    console.log(`  多事件链 ✅ 4 events, deterministic, canonicalize len=${c1.length}`);
+    console.log(`    trust=${r1.finalState!.trust.toFixed(2)}, moodBaseline=${r1.finalState!.moodBaseline.toFixed(2)}`);
+    console.log(`    episodicBuffer.length=${r1.finalState!.episodicBuffer.length}`);
+
+    // 5. verifyEventChain 也应该 valid（完整链）
+    const chain = await verifyEventChain(id);
+    assert.equal(chain.verdict, 'valid', '多事件链 verifyEventChain 应 valid');
+    assert.equal(chain.eventCount, 4);
   } finally {
     await sql`DELETE FROM events WHERE identity_id = ${id}`;
   }

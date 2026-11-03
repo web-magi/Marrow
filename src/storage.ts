@@ -31,7 +31,7 @@ import { getDb } from './db/connection.js';
  * - V1 JSONL 继续作为独立封存档案，本 ID 启动的任何流程都不读取 V1 数据。
  * - 同一 PostgreSQL 数据库中，两个 identity 通过 identity_id 列自然隔离。
  */
-export const IDENTITY_ID = 'marrow-v2';
+export const IDENTITY_ID = 'marrow-v2-birth2';
 
 /** M1 起新写入事件的 schema 版本 */
 export const SCHEMA_VERSION = 2;

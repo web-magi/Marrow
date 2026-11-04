@@ -44,3 +44,7 @@ coverage/
 
 # Runtime data (event log, generated at runtime)
 data/
+
+# Dashboard build artifacts (vue-tsc emits for vite.config.ts)
+dashboard/vite.config.js
+dashboard/vite.config.d.ts

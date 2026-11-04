@@ -477,6 +477,79 @@ export async function loadEventRows(
 }
 
 /**
+ * Dashboard / 开发者层只读查询：事件计数。
+ *
+ * 用途：/api/runtime 端点返回 eventCount。
+ * 只做 SELECT COUNT。绝不影响写入路径。
+ */
+export async function countEvents(identityId: string = IDENTITY_ID): Promise<number> {
+  const sql = getDb();
+  const rows = await sql`SELECT COUNT(*)::int AS c FROM events WHERE identity_id = ${identityId}`;
+  return (rows[0] as { c: number }).c;
+}
+
+/**
+ * Dashboard / 开发者层只读查询：分页 + 过滤获取事件行。
+ *
+ * 用途：Dashboard /api/events 端点、CLI 工具。
+ * 与 loadEventRows 的区别：支持 limit/offset/type/since/until。
+ *
+ * 只做 SELECT。绝不影响任何写入路径或 replay 正确性。
+ */
+export interface QueryEventRowsOptions {
+  /** 上限 200，默认 50 */
+  limit?: number;
+  /** 默认 0 */
+  offset?: number;
+  /** event_type 过滤，可单值或数组 */
+  type?: string | string[];
+  /** timestamp >= ISO 8601 */
+  since?: string;
+  /** timestamp <= ISO 8601 */
+  until?: string;
+}
+
+export async function queryEventRows(
+  identityId: string = IDENTITY_ID,
+  options: QueryEventRowsOptions = {},
+): Promise<PersistedEventRow[]> {
+  const sql = getDb();
+  const { limit = 50, offset = 0, type, since, until } = options;
+
+  const safeLimit = Math.min(Math.max(1, Math.floor(limit)), 200);
+  const safeOffset = Math.max(0, Math.floor(offset));
+  const types = Array.isArray(type) ? type : (type ? [type] : null);
+
+  const whereClauses: any[] = [sql`identity_id = ${identityId}`];
+  if (types && types.length > 0) {
+    whereClauses.push(sql`event_type IN ${sql(types)}`);
+  }
+  if (since) {
+    whereClauses.push(sql`"timestamp" >= ${since}`);
+  }
+  if (until) {
+    whereClauses.push(sql`"timestamp" <= ${until}`);
+  }
+
+  const combined = whereClauses.reduce(
+    (acc, clause, i) => (i === 0 ? clause : sql`${acc} AND ${clause}`),
+    sql``,
+  );
+
+  return (await sql`
+    SELECT
+      sequence::text AS sequence,
+      event_id, identity_id, "timestamp", event_type,
+      schema_version, engine_version, causation_id, correlation_id,
+      previous_event_hash, event_hash, payload
+    FROM events
+    WHERE ${combined}
+    ORDER BY sequence DESC
+    LIMIT ${safeLimit} OFFSET ${safeOffset}
+  `) as PersistedEventRow[];
+}
+
+/**
  * 生成事件唯一 ID
  *
  * 格式：timestamp-random

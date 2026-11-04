@@ -16,7 +16,7 @@ import { createServer } from 'node:http';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { applyEvent, evokeMemoryFromText, computeEpisodicMemoryCandidate, type MarrowState } from './state.js';
-import { appendEvents, IDENTITY_ID, generateEventId } from './storage.js';
+import { appendEvents, IDENTITY_ID, generateEventId, queryEventRows, countEvents, type QueryEventRowsOptions } from './storage.js';
 import {
   acquireIdentityOwnership,
   freshStartIdentity,
@@ -919,15 +919,77 @@ const MONITOR_HTML = `<!DOCTYPE html>
 
 /** 启动 HTTP 监控服务器 */
 function startMonitorServer(sensors: SensorProvider): void {
-  const server = createServer((req, res) => {
-    if (req.url === '/api/state') {
-      const response = {
+  const server = createServer(async (req, res) => {
+    // === 安全头 ===
+    res.setHeader('Access-Control-Allow-Origin', 'http://localhost:*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    const url = new URL(req.url ?? '/', `http://localhost:${MONITOR_PORT}`);
+
+    // === 只读端点 ===
+    if (url.pathname === '/api/state') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
         current: currentState,
         history: stateHistory,
         timeScale: TIME_SCALE,
-      };
+      }));
+    } else if (url.pathname === '/api/dialogue') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(response));
+      res.end(JSON.stringify(dialogueHistory));
+    } else if (url.pathname === '/api/runtime') {
+      // Runtime 状态快照（只读）
+      const snapshot = runtimeSession.snapshot();
+      const eventCount = await countEvents(IDENTITY_ID);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        identityId: snapshot.identityId,
+        closed: snapshot.closed,
+        uptimeSeconds: currentState?.uptimeSeconds ?? 0,
+        eventCount,
+        tick: snapshot.tick,
+        queue: {
+          active: snapshot.active,
+          reserved: snapshot.reserved,
+          ready: snapshot.ready,
+          waiting: snapshot.waiting,
+          running: snapshot.running,
+          runningChatId: snapshot.runningChatId,
+          runningTaskKind: snapshot.runningTaskKind,
+        },
+      }));
+    } else if (url.pathname === '/api/events') {
+      // EventStore 查询（只读，分页/过滤）
+      if (req.method !== 'GET') {
+        res.writeHead(405);
+        res.end('Method Not Allowed');
+        return;
+      }
+      const options: QueryEventRowsOptions = {
+        limit: parseInt(url.searchParams.get('limit') ?? '50', 10) || 50,
+        offset: parseInt(url.searchParams.get('offset') ?? '0', 10) || 0,
+        type: url.searchParams.getAll('type').length > 0
+          ? url.searchParams.getAll('type')
+          : undefined,
+        since: url.searchParams.get('since') ?? undefined,
+        until: url.searchParams.get('until') ?? undefined,
+      };
+      try {
+        const rows = await queryEventRows(IDENTITY_ID, options);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(rows));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: (err as Error).message }));
+      }
     } else if (req.url === '/api/collision' && req.method === 'POST') {
       // 测试端点：手动触发一次碰撞
       const motionSensor = sensors.motion as SimulatedMotionSensor;
@@ -936,7 +998,6 @@ function startMonitorServer(sensors: SensorProvider): void {
       res.end(JSON.stringify({ ok: true, message: 'collision triggered' }));
     } else if (req.url?.startsWith('/api/battery') && req.method === 'POST') {
       // 测试端点：设置电池电量
-      const url = new URL(req.url, `http://localhost:${MONITOR_PORT}`);
       const level = parseFloat(url.searchParams.get('level') ?? '100');
       const batterySensor = sensors.battery as SimulatedBatterySensor;
       batterySensor.setLevel(level);
@@ -946,13 +1007,20 @@ function startMonitorServer(sensors: SensorProvider): void {
       // 阶段四：对话端点
       // 接收用户输入 → LLM 生成候选 → 状态机过滤 → 写入事件 → 返回回复
       handleChatRequest(req, res);
-    } else if (req.url === '/api/dialogue') {
-      // 返回对话历史
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(dialogueHistory));
-    } else if (req.url === '/' || req.url === '/index.html') {
+    } else if (url.pathname === '/legacy/monitor') {
+      // 旧 Monitor（迁移期保留）
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(MONITOR_HTML);
+    } else if (url.pathname === '/' || url.pathname === '/index.html') {
+      // Dashboard V1：优先加载 Vue 构建产物，fallback 到旧 Monitor
+      const dashboardIndex = join(process.cwd(), 'dashboard', 'dist', 'index.html');
+      if (existsSync(dashboardIndex)) {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(readFileSync(dashboardIndex));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(MONITOR_HTML);
+      }
     } else {
       res.writeHead(404);
       res.end('Not Found');
@@ -961,10 +1029,15 @@ function startMonitorServer(sensors: SensorProvider): void {
 
   server.listen(MONITOR_PORT, () => {
     console.log(`Monitor server: http://localhost:${MONITOR_PORT}`);
-    console.log(`  POST /api/collision       - trigger collision`);
+    console.log(`  GET  /                - Dashboard V1 (Vue, 构建后自动加载)`);
+    console.log(`  GET  /legacy/monitor  - Legacy Monitor (内嵌 HTML)`);
+    console.log(`  GET  /api/state       - current + history`);
+    console.log(`  GET  /api/events      - EventStore 查询 (limit/offset/type/since/until)`);
+    console.log(`  GET  /api/runtime     - Runtime 状态快照 (queue/tick/uptime/eventCount)`);
+    console.log(`  GET  /api/dialogue    - 对话历史`);
+    console.log(`  POST /api/chat        - send message ({"message":"..."})`);
+    console.log(`  POST /api/collision   - trigger collision`);
     console.log(`  POST /api/battery?level=N - set battery level`);
-    console.log(`  POST /api/chat            - send message ({"message":"..."})`);
-    console.log(`  GET  /api/dialogue        - get dialogue history`);
   });
 }
 

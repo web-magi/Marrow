@@ -14,9 +14,14 @@
 
 import { createServer } from 'node:http';
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import { applyEvent, evokeMemoryFromText, computeEpisodicMemoryCandidate, type MarrowState } from './state.js';
-import { appendEvents, IDENTITY_ID, generateEventId, queryEventRows, countEvents, type QueryEventRowsOptions } from './storage.js';
+import { appendEvents, IDENTITY_ID, generateEventId, queryEventRows, countEvents } from './storage.js';
+import {
+  buildEventsApiResponse,
+  buildRuntimeApiResponse,
+  parseEventsQueryParams,
+} from './dashboard-api.js';
 import {
   acquireIdentityOwnership,
   freshStartIdentity,
@@ -50,7 +55,12 @@ import {
   EXTRACTOR_VERSION,
   type LLMClient,
   type ExtractionResult,
+  type LlmDialogueContext,
 } from './llm.js';
+import {
+  buildDialogueContext,
+  loadRecentDialogueHistory,
+} from './dialogue-context.js';
 import { appraise, type AppraisalContext } from './appraisal.js';
 import { filterCandidateBehavior } from './dialogue.js';
 import type {
@@ -101,6 +111,17 @@ const TICK_INTERVAL_MS = 10_000;
 
 /** HTTP 监控服务器端口 */
 const MONITOR_PORT = 8787;
+
+/**
+ * HTTP 绑定地址（安全边界）。
+ *
+ * 默认仅绑定 127.0.0.1：Dashboard、/api/dialogue（原始对话文本）、/api/state
+ * （完整状态含记忆摘要）都属于 localhost 信任边界内的接口，不对局域网开放。
+ * CORS 不是访问控制手段——本服务不再输出 Access-Control-Allow-Origin，
+ * 浏览器跨源读取被默认拒绝；访问边界由绑定地址保证。
+ * 仅在明确需要远程访问时通过 MARROW_HTTP_HOST 覆盖（自行承担暴露风险）。
+ */
+const MONITOR_HOST = process.env.MARROW_HTTP_HOST ?? '127.0.0.1';
 
 /** 状态历史缓冲区大小（用于绘制曲线） */
 const HISTORY_SIZE = 500;
@@ -267,9 +288,32 @@ async function handleChatRequest(
   //    extracting 计入容量但不占用执行器。
   //    C3：传入 admission.signal——等待超时/释放/关闭会取消底层请求；
   //    即使模型不支持取消，迟到结果也会被 markReady 丢弃。
+  //
+  // M1.4.5 对话上下文连续性（边界说明，修改前请先读全）：
+  // - 历史只来自 EventStore 中已提交的 dialogue 事件（不读内存临时状态），
+  //   因而天然不包含本轮尚未写入的 user_input；读取失败自动降级为无历史。
+  // - 这里在“请求阶段”检索一次情景记忆，结果同时用于：LLM 上下文、
+  //   Appraisal 证据 ID、Memory Formation Candidate（下方共用同一个 evoked）。
+  // - applyDialogue（state.ts）内部仍会执行状态机自己的记忆检索，用于记忆
+  //   唤起对 mood/energy/内耗的影响，并写入 lastEvokedMemory。因此“每次 Chat
+  //   只检索一次记忆”并不成立：生产路径共有请求阶段与执行阶段两处检索。
+  // - 正常时序下两处检索的输入缓冲区相同、结果一致；但并发 Chat 提交造成的
+  //   新记忆/状态变化，或 Tick 的显著性衰减，可能让请求时刻与执行时刻的
+  //   检索结果出现差异（通常为衰减量级，并发时也可能选中不同记忆）。
+  // - AppraisalEvent 的 evidenceAssociationIds 是历史字段名，当前实际承载的
+  //   是 EpisodicMemory ID（epi-<eventId>），不是 AssociationMemory ID。
+  const history = await loadRecentDialogueHistory(IDENTITY_ID);
+  const evoked = evokeMemoryFromText(state.episodicBuffer, userInput);
+  const dialogueContext: LlmDialogueContext = buildDialogueContext(history, evoked);
+
   try {
     const snapshot = buildStateSnapshot(state);
-    candidate = await llmClient.generateResponse(snapshot, userInput, admission.signal);
+    candidate = await llmClient.generateResponse(
+      snapshot,
+      userInput,
+      admission.signal,
+      dialogueContext,
+    );
   } catch (err) {
     if (admission.signal.aborted) {
       // admission 已因等待超时/关闭被移除：容量已释放，结果不会进入执行器
@@ -325,8 +369,9 @@ async function handleChatRequest(
     const stateAfterObservation = applyEvent(state, observationEvent);
 
     // 3. appraise：基于动态状态 + 观察置信度计算多维情绪增量
-    //    记忆唤醒证据链与 applyDialogue 内部逻辑保持一致的确定性检索
-    const evoked = evokeMemoryFromText(stateAfterObservation.episodicBuffer, userInput);
+    //    M1.4.5：直接复用请求时刻的唯一一次记忆检索结果（evoked），
+    //    保证注入 LLM 的记忆与 Runtime 本轮实际使用的记忆是同一对象，
+    //    不再为上下文注入而重复检索一次。
     const appraisalContext: AppraisalContext = {
       associationWeight: stateAfterObservation.associationWeight,
       trust: stateAfterObservation.trust,
@@ -921,18 +966,12 @@ const MONITOR_HTML = `<!DOCTYPE html>
 function startMonitorServer(sensors: SensorProvider): void {
   const server = createServer(async (req, res) => {
     // === 安全头 ===
-    res.setHeader('Access-Control-Allow-Origin', 'http://localhost:*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    // 不输出 Access-Control-Allow-Origin：CORS 不是认证机制。
+    // Dashboard 由本服务同源提供；Vite dev server 通过 proxy 访问（对浏览器
+    // 同样表现为同源）。访问控制由 127.0.0.1 绑定地址承担（见 MONITOR_HOST）。
     res.setHeader('X-Content-Type-Options', 'nosniff');
 
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204);
-      res.end();
-      return;
-    }
-
-    const url = new URL(req.url ?? '/', `http://localhost:${MONITOR_PORT}`);
+    const url = new URL(req.url ?? '/', `http://${MONITOR_HOST}:${MONITOR_PORT}`);
 
     // === 只读端点 ===
     if (url.pathname === '/api/state') {
@@ -943,52 +982,51 @@ function startMonitorServer(sensors: SensorProvider): void {
         timeScale: TIME_SCALE,
       }));
     } else if (url.pathname === '/api/dialogue') {
+      // 原始对话文本：仅 localhost 边界内可用（绑定地址保证），不下发 CORS。
+      // Dashboard DialoguePanel 默认展示完整文本，这是本地单用户场景的既定设计。
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(dialogueHistory));
     } else if (url.pathname === '/api/runtime') {
-      // Runtime 状态快照（只读）
-      const snapshot = runtimeSession.snapshot();
-      const eventCount = await countEvents(IDENTITY_ID);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        identityId: snapshot.identityId,
-        closed: snapshot.closed,
-        uptimeSeconds: currentState?.uptimeSeconds ?? 0,
-        eventCount,
-        tick: snapshot.tick,
-        queue: {
-          active: snapshot.active,
-          reserved: snapshot.reserved,
-          ready: snapshot.ready,
-          waiting: snapshot.waiting,
-          running: snapshot.running,
-          runningChatId: snapshot.runningChatId,
-          runningTaskKind: snapshot.runningTaskKind,
-        },
-      }));
+      // Runtime 状态快照（只读）。session 关闭后仍返回 closed=true 的快照；
+      // 数据库不可用时返回明确 500，绝不静默返回过期数据。
+      try {
+        const snapshot = runtimeSession.snapshot();
+        const eventCount = await countEvents(IDENTITY_ID);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify(
+            buildRuntimeApiResponse(snapshot, currentState?.uptimeSeconds ?? 0, eventCount),
+          ),
+        );
+      } catch (err) {
+        console.error('[API] /api/runtime 查询失败:', err);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'runtime status query failed' }));
+      }
     } else if (url.pathname === '/api/events') {
-      // EventStore 查询（只读，分页/过滤）
+      // EventStore 查询（只读）。
+      // 安全契约：默认只返回事件元数据 + 逐类型白名单的非敏感摘要，
+      // 绝不下发原始对话文本等未明确允许的 payload 字段（见 dashboard-api.ts）。
       if (req.method !== 'GET') {
         res.writeHead(405);
         res.end('Method Not Allowed');
         return;
       }
-      const options: QueryEventRowsOptions = {
-        limit: parseInt(url.searchParams.get('limit') ?? '50', 10) || 50,
-        offset: parseInt(url.searchParams.get('offset') ?? '0', 10) || 0,
-        type: url.searchParams.getAll('type').length > 0
-          ? url.searchParams.getAll('type')
-          : undefined,
-        since: url.searchParams.get('since') ?? undefined,
-        until: url.searchParams.get('until') ?? undefined,
-      };
+      const parsed = parseEventsQueryParams(url.searchParams);
+      if (!parsed.ok) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: parsed.error }));
+        return;
+      }
       try {
-        const rows = await queryEventRows(IDENTITY_ID, options);
+        const rows = await queryEventRows(IDENTITY_ID, parsed.options);
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(rows));
+        res.end(JSON.stringify(buildEventsApiResponse(rows, parsed.options.limit ?? 50)));
       } catch (err) {
+        // 不把数据库错误细节（可能含 SQL 片段）泄露给客户端
+        console.error('[API] /api/events 查询失败:', err);
         res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: (err as Error).message }));
+        res.end(JSON.stringify({ error: 'event query failed' }));
       }
     } else if (req.url === '/api/collision' && req.method === 'POST') {
       // 测试端点：手动触发一次碰撞
@@ -1011,6 +1049,26 @@ function startMonitorServer(sensors: SensorProvider): void {
       // 旧 Monitor（迁移期保留）
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(MONITOR_HTML);
+    } else if (url.pathname.startsWith('/assets/')) {
+      // Dashboard 静态资源（JS/CSS 等构建产物）
+      const assetsRoot = resolve(process.cwd(), 'dashboard', 'dist', 'assets');
+      const filePath = resolve(assetsRoot, decodeURIComponent(url.pathname.slice('/assets/'.length)));
+      // 路径穿越防护：解析结果必须仍在 assets 目录内
+      if (!filePath.startsWith(assetsRoot + sep) || !existsSync(filePath)) {
+        res.writeHead(404);
+        res.end('Not Found');
+        return;
+      }
+      const ext = filePath.slice(filePath.lastIndexOf('.'));
+      const mime =
+        ext === '.js' ? 'text/javascript; charset=utf-8'
+        : ext === '.css' ? 'text/css; charset=utf-8'
+        : ext === '.svg' ? 'image/svg+xml'
+        : ext === '.png' ? 'image/png'
+        : ext === '.woff2' ? 'font/woff2'
+        : 'application/octet-stream';
+      res.writeHead(200, { 'Content-Type': mime });
+      res.end(readFileSync(filePath));
     } else if (url.pathname === '/' || url.pathname === '/index.html') {
       // Dashboard V1：优先加载 Vue 构建产物，fallback 到旧 Monitor
       const dashboardIndex = join(process.cwd(), 'dashboard', 'dist', 'index.html');
@@ -1027,12 +1085,12 @@ function startMonitorServer(sensors: SensorProvider): void {
     }
   });
 
-  server.listen(MONITOR_PORT, () => {
-    console.log(`Monitor server: http://localhost:${MONITOR_PORT}`);
+  server.listen(MONITOR_PORT, MONITOR_HOST, () => {
+    console.log(`Monitor server: http://${MONITOR_HOST}:${MONITOR_PORT} (bound to ${MONITOR_HOST} only)`);
     console.log(`  GET  /                - Dashboard V1 (Vue, 构建后自动加载)`);
     console.log(`  GET  /legacy/monitor  - Legacy Monitor (内嵌 HTML)`);
     console.log(`  GET  /api/state       - current + history`);
-    console.log(`  GET  /api/events      - EventStore 查询 (limit/offset/type/since/until)`);
+    console.log(`  GET  /api/events      - EventStore 查询 (limit/beforeSequence/afterSequence/type/since/until，元数据+白名单摘要)`);
     console.log(`  GET  /api/runtime     - Runtime 状态快照 (queue/tick/uptime/eventCount)`);
     console.log(`  GET  /api/dialogue    - 对话历史`);
     console.log(`  POST /api/chat        - send message ({"message":"..."})`);
@@ -1137,6 +1195,16 @@ async function main(): Promise<void> {
     await runtimeSession
       .requestTick(async () => {
         try {
+          // 状态同步（M1.4.3 修复）：
+          // tickSession.state 是 Tick 的演化起点，但 Chat 提交时会更新 currentState
+          // 而不经过 TickSession。若这里不从 currentState 重新播种，下一轮 Tick
+          // 会从 Chat 之前的旧快照继续演化，导致 Chat 造成的心情/信任/记忆形成
+          // 等变更在 10 秒内被静默回滚，内存状态也会与已持久化的事件流不一致。
+          // 仅在无待重试批次时同步：pendingBatch 的 nextState 是失败前快照的
+          // 确定性延续，不能被替换（commit-unknown 防护语义保持不变）。
+          if (!tickSession.pendingBatch && currentState) {
+            tickSession.state = currentState;
+          }
           const batch = await executeTick(
             tickSession,
             sensors,

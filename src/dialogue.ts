@@ -48,9 +48,6 @@ const NUMB_COGNITIVE_LOAD_THRESHOLD = 80;
 /** 触发走神插入的注意力阈值（attention_focus 域为 0-1） */
 const WANDER_ATTENTION_THRESHOLD = 0.2;
 
-/** 走神前缀（舞台指示，不占发言字数） */
-const WANDER_PREFIX = '……你刚才说什么？（愣了一下）';
-
 /** 内耗过载前缀（舞台指示） */
 const NUMB_PREFIX = '（没有力气说话）';
 
@@ -133,10 +130,11 @@ export function filterCandidateBehavior(
     }
   }
 
-  // 规则 5（最后叠加）：注意力极度涣散 → 前缀插入走神表现
-  // 放在限长之后：走神是无意识的舞台指示，不应被字数硬约束截断
+  // 规则 5（最后标记）：注意力极度涣散
+  // 仅标记 filterReason 为可观测事件，不再注入固定话术。
+  // 低注意力的表达影响由 System Prompt 负责（缩短、迟疑等软约束），
+  // 过滤层不代替 LLM 生成自然语言。
   if (state.attentionFocus < WANDER_ATTENTION_THRESHOLD) {
-    text = WANDER_PREFIX + text;
     filtered = true;
     filterReason = filterReason ? `${filterReason}+attention_wander` : 'attention_wander';
   }

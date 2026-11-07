@@ -499,8 +499,18 @@ export async function countEvents(identityId: string = IDENTITY_ID): Promise<num
 export interface QueryEventRowsOptions {
   /** 上限 200，默认 50 */
   limit?: number;
-  /** 默认 0 */
+  /** 默认 0（兼容旧分页；新调用方应优先使用 sequence 游标） */
   offset?: number;
+  /**
+   * 游标分页：仅返回 sequence < beforeSequence 的行（更早的事件页）。
+   * 十进制数字字符串——BIGSERIAL 可能超出 JS 安全整数，禁止传 Number。
+   */
+  beforeSequence?: string;
+  /**
+   * 游标分页：仅返回 sequence > afterSequence 的行（比游标更新的事件）。
+   * 十进制数字字符串，规则同上。
+   */
+  afterSequence?: string;
   /** event_type 过滤，可单值或数组 */
   type?: string | string[];
   /** timestamp >= ISO 8601 */
@@ -514,11 +524,21 @@ export async function queryEventRows(
   options: QueryEventRowsOptions = {},
 ): Promise<PersistedEventRow[]> {
   const sql = getDb();
-  const { limit = 50, offset = 0, type, since, until } = options;
+  const { limit = 50, offset = 0, type, since, until, beforeSequence, afterSequence } = options;
 
   const safeLimit = Math.min(Math.max(1, Math.floor(limit)), 200);
   const safeOffset = Math.max(0, Math.floor(offset));
   const types = Array.isArray(type) ? type : (type ? [type] : null);
+
+  // 游标必须是十进制数字字符串（调用方契约），参数化 + 显式 bigint 转换，
+  // 避免精度丢失，也绝不拼接进 SQL 文本。
+  const SEQUENCE_CURSOR_PATTERN = /^\d+$/;
+  if (beforeSequence !== undefined && !SEQUENCE_CURSOR_PATTERN.test(beforeSequence)) {
+    throw new TypeError(`beforeSequence 必须是十进制数字字符串，收到: ${beforeSequence.slice(0, 32)}`);
+  }
+  if (afterSequence !== undefined && !SEQUENCE_CURSOR_PATTERN.test(afterSequence)) {
+    throw new TypeError(`afterSequence 必须是十进制数字字符串，收到: ${afterSequence.slice(0, 32)}`);
+  }
 
   const whereClauses: any[] = [sql`identity_id = ${identityId}`];
   if (types && types.length > 0) {
@@ -529,6 +549,12 @@ export async function queryEventRows(
   }
   if (until) {
     whereClauses.push(sql`"timestamp" <= ${until}`);
+  }
+  if (beforeSequence !== undefined) {
+    whereClauses.push(sql`sequence < ${beforeSequence}::bigint`);
+  }
+  if (afterSequence !== undefined) {
+    whereClauses.push(sql`sequence > ${afterSequence}::bigint`);
   }
 
   const combined = whereClauses.reduce(

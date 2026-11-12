@@ -10,6 +10,8 @@
  * - 事件一旦写入不可修改（事件溯源）
  */
 
+import type { ExperienceValenceStatus } from './experience-valence.js';
+
 /** 事件类型判别字段 */
 export type EventType =
   | 'genesis'
@@ -177,6 +179,22 @@ export interface DialogueEvent extends BaseEvent {
      * 旧事件可能缺失
      */
     appraisalId?: string;
+    /**
+     * 显式回复关联（M1.5.4.2）
+     *
+     * 仅允许出现在 direction='companion_output' 的事件上，值为产生本回复的
+     * 那条 DialogueEvent(role=user_input) 的真实事件 ID。
+     *
+     * 语义边界：
+     * - 由生产 Runtime 在生成回复时明确写入，不通过事件顺序 / 时间窗口 /
+     *   模型推测生成；
+     * - 只证明「Runtime 声明这条回复针对哪条用户输入」，不代表用户阅读、
+     *   接受、满意或认同该回复（不是反馈证据）；
+     * - 历史事件缺失该字段是合法状态，恢复时不得按时间或顺序自动补齐。
+     *
+     * 旧事件可能缺失
+     */
+    replyToEventId?: string;
   };
 }
 
@@ -231,6 +249,25 @@ export interface ObservationEvent extends BaseEvent {
     }>;
     /** 提取器版本（便于回放时按版本兼容旧格式） */
     extractorVersion: string;
+    /**
+     * 用户经历本身的情绪极性 -1..1（M1.5.4.1）
+     *
+     * 只在 experienceValenceStatus 为 observed/neutral/mixed 时存在；
+     * unknown / extraction_failed 必须缺失——缺失是语义，写 0 会被误读为"真实中性"。
+     * 旧事件没有该字段，属于合法历史形态（不可用，不推断）。
+     */
+    experienceValence?: number;
+    /**
+     * 体验性质状态（M1.5.4.1，五态）
+     *
+     * observed：明确单一极性（数值非 0）
+     * neutral：明确中性（数值为 0）
+     * mixed：正负混合（数值允许 0）
+     * unknown：提取成功但无法判断（无数值）
+     * extraction_failed：结构化提取失败（无数值）
+     * 旧事件缺少该字段，表示"不可用"，不等于 unknown。
+     */
+    experienceValenceStatus?: ExperienceValenceStatus;
   };
 }
 

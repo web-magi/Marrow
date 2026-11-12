@@ -17,7 +17,7 @@
  */
 
 import type { MarrowState } from './state.js';
-import type { DialogueAction } from './events.js';
+import type { DialogueAction, DialogueEvent } from './events.js';
 import { buildStateSnapshot, type CandidateBehavior, type StateSnapshot } from './llm.js';
 
 /** 过滤结果 */
@@ -148,6 +148,58 @@ export function filterCandidateBehavior(
 function truncate(text: string, maxLength: number): string {
   if (text.length <= maxLength) return text;
   return text.slice(0, maxLength) + '…';
+}
+
+/**
+ * 构建 companion_output 事件的参数（M1.5.4.2）。
+ *
+ * replyToEventId 必须由调用方传入「本轮 user_input 事件的真实 Event ID」，
+ * 不允许传入临时 ID、数组下标或 correlation_id。
+ */
+export interface CompanionOutputEventParams {
+  /** 伴侣输出事件的真实事件 ID（由 generateEventId 生成） */
+  id: string;
+  /** 事件时间戳（ISO 8601，与同批次事件单调递增） */
+  timestamp: string;
+  /** 状态机过滤结果 */
+  filterResult: FilterResult;
+  /** LLM 原始候选文本（保留供审计） */
+  candidateText: string;
+  /** 产生本回复的 user_input 事件真实 ID（显式关联） */
+  replyToEventId: string;
+}
+
+/**
+ * 构建 companion_output DialogueEvent（M1.5.4.2 生产构造唯一入口）。
+ *
+ * 显式关联的写入点：replyToEventId 直接来自同批次已构造完成的 userEvent.id，
+ * 不经时间窗口、事件顺序或 LLM 推测。
+ *
+ * fail-closed：replyToEventId 缺失 / 非字符串 / 空字符串时直接抛错，
+ * 绝不构造一条缺少关联或带有虚假关联的 companion_output 事件。
+ */
+export function buildCompanionOutputEvent(
+  params: CompanionOutputEventParams,
+): DialogueEvent {
+  if (typeof params.replyToEventId !== 'string' || params.replyToEventId.length === 0) {
+    throw new Error('buildCompanionOutputEvent: replyToEventId 必须是非空字符串');
+  }
+  return {
+    type: 'dialogue',
+    id: params.id,
+    timestamp: params.timestamp,
+    payload: {
+      direction: 'companion_output',
+      text: params.filterResult.text,
+      moodDelta: 0,
+      salience: 0.3,
+      wordCount: params.filterResult.text.length,
+      candidateText: params.candidateText,
+      filtered: params.filterResult.filtered,
+      filterReason: params.filterResult.filterReason || undefined,
+      replyToEventId: params.replyToEventId,
+    },
+  };
 }
 
 /**

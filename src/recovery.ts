@@ -51,6 +51,7 @@ import {
 } from './storage.js';
 import { getDb } from './db/connection.js';
 import { verifyEventChain } from './verify-chain.js';
+import { validateExperienceValenceFields } from './experience-valence.js';
 
 // ==================================================================
 // 错误与结果类型
@@ -70,6 +71,8 @@ export type ReplayErrorKind =
   | 'unsupported_schema_version'
   /** 历史 engine_version 不在支持集合内 */
   | 'unsupported_engine_version'
+  /** 显式回复关联 replyToEventId 指向非法目标（不存在 / 跨 identity / 非 user_input / 不在之前） */
+  | 'invalid_reference'
   /** 恢复出的最终状态违反状态不变量（量程 / 有限性） */
   | 'state_invariant_violation';
 
@@ -365,7 +368,7 @@ function validateRowForReplay(row: PersistedEventRow): ReplayError | null {
       }
       return null;
 
-    case 'dialogue':
+    case 'dialogue': {
       if (payload.direction !== 'user_input' && payload.direction !== 'companion_output') {
         return fail('invalid_payload', 'dialogue 的 direction 非法');
       }
@@ -377,7 +380,29 @@ function validateRowForReplay(row: PersistedEventRow): ReplayError | null {
       if (!isFiniteNumber(payload.moodDelta) || !isFiniteNumber(payload.salience)) {
         return fail('invalid_payload', 'dialogue 缺少 moodDelta/salience 数值');
       }
+      // M1.5.4.2 第一层（Payload Validation）：显式回复关联字段
+      // - 历史事件缺失该字段是合法状态（不补齐、不推断）
+      // - 只允许 companion_output 携带；user_input 携带一律拒绝
+      // - 值必须是非空字符串（null / 非字符串 / 空串 / 纯空白均拒绝）
+      // 目标是否存在 / 是否在前 / 是否同 identity / 是否为 user_input
+      // 属于第二层 Identity-level Referential Validation（见 replayPersistedEvents）
+      if (Object.prototype.hasOwnProperty.call(payload, 'replyToEventId')) {
+        const replyTo = payload.replyToEventId;
+        if (payload.direction !== 'companion_output') {
+          return fail(
+            'invalid_payload',
+            'dialogue.replyToEventId 仅允许出现在 companion_output（user_input 不得携带）',
+          );
+        }
+        if (typeof replyTo !== 'string' || replyTo.length === 0) {
+          return fail('invalid_payload', 'dialogue.replyToEventId 必须是非空字符串');
+        }
+        if (replyTo.trim().length === 0) {
+          return fail('invalid_payload', 'dialogue.replyToEventId 不得为纯空白字符串');
+        }
+      }
       return null;
+    }
 
     case 'memory_evocation':
       if (
@@ -450,6 +475,12 @@ function validateRowForReplay(row: PersistedEventRow): ReplayError | null {
       }
       if (typeof payload.extractorVersion !== 'string') {
         return fail('invalid_payload', 'observation 缺少 extractorVersion');
+      }
+      // M1.5.4.1：体验性质字段的可选校验（旧事件缺失合法；存在则必须自洽）
+      // 规则与提取阶段共用同一纯函数，不重复维护第二套语义。
+      const valenceError = validateExperienceValenceFields(payload);
+      if (valenceError) {
+        return fail('invalid_payload', valenceError);
       }
       return null;
 
@@ -525,6 +556,53 @@ function validateRecoveredState(state: MarrowState): string | null {
 // 确定性 Replay
 // ==================================================================
 
+// ==================================================================
+// 显式回复关联：第二层 Identity-level Referential Validation（M1.5.4.2）
+// ==================================================================
+
+/**
+ * 读取 companion_output 事件携带的 replyToEventId。
+ *
+ * 第一层 validateRowForReplay 已保证该字段若存在必为非空字符串，
+ * 这里只负责提取；其它事件类型返回 null。
+ */
+function readReplyToEventId(row: PersistedEventRow): string | null {
+  if (row.event_type !== 'dialogue') return null;
+  const event = row.payload as unknown;
+  if (!isPlainObject(event)) return null;
+  const payload = event.payload;
+  if (!isPlainObject(payload)) return null;
+  if (payload.direction !== 'companion_output') return null;
+  const raw = payload.replyToEventId;
+  return typeof raw === 'string' && raw.length > 0 ? raw : null;
+}
+
+/** 构造引用校验失败错误（携带精确定位） */
+function replyReferenceError(row: PersistedEventRow, message: string): ReplayError {
+  return {
+    identityId: row.identity_id,
+    sequence: row.sequence,
+    eventId: row.event_id,
+    eventType: row.event_type,
+    schemaVersion: row.schema_version,
+    engineVersion: row.engine_version,
+    kind: 'invalid_reference',
+    message: `${message}（sequence=${row.sequence} event_id=${row.event_id}）`,
+  };
+}
+
+/**
+ * 判断某行是否为 DialogueEvent(direction='user_input')。
+ * 只用于建立已见事件索引，不参与状态演化。
+ */
+function isUserInputRow(row: PersistedEventRow): boolean {
+  if (row.event_type !== 'dialogue') return false;
+  const event = row.payload as unknown;
+  if (!isPlainObject(event)) return false;
+  const payload = event.payload;
+  return isPlainObject(payload) && payload.direction === 'user_input';
+}
+
 /**
  * 从持久化事件行确定性重建状态（纯函数，不访问数据库 / LLM / 传感器）。
  *
@@ -577,6 +655,21 @@ export function replayPersistedEvents(
   // genesis 在首行时 state 已由 applyGenesis 初始化，循环从 index 1 开始，
   // 避免对 genesis 行重复执行 applyEvent（applyEvent 对 genesis 调 applyGenesis 但
   // 不会改变已由 createInitialState 构建的内容——这里显式跳过，语义更清晰）
+  //
+  // M1.5.4.2 第二层引用校验索引（只使用本次恢复已加载的完整事件链，不新增查询）：
+  // - allEventIds：本 identity 全链事件 ID，用于区分「未来事件」与「不存在/其他 identity」
+  // - seenEventIds：已通过校验的事件 ID（严格位于当前行之前）
+  // - seenUserInputIds：已通过的 user_input 事件 ID
+  // 事件 ID 在 events 表中全局 UNIQUE，因此其他 identity 的事件不会出现在本链中，
+  // 引用它会自然落入「不存在于当前 identity 事件链」分支并被拒绝。
+  const allEventIds = new Set<string>();
+  for (const row of rows) allEventIds.add(row.event_id);
+  const seenEventIds = new Set<string>();
+  const seenUserInputIds = new Set<string>();
+  if (firstType === 'genesis') {
+    seenEventIds.add(rows[0]!.event_id);
+  }
+
   for (let i = firstType === 'genesis' ? 1 : 0; i < rows.length; i++) {
     const row = rows[i]!;
     if (row.event_type === 'genesis') {
@@ -602,6 +695,43 @@ export function replayPersistedEvents(
     if (invalid) {
       return { ...base, verdict: 'invalid', errors: [invalid] };
     }
+
+    // M1.5.4.2 第二层：显式回复关联的引用完整性
+    // 必须在 applyEvent 与索引登记之前执行（自引用 / 未来引用一律不通过）
+    const replyTo = readReplyToEventId(row);
+    if (replyTo !== null) {
+      if (!seenEventIds.has(replyTo)) {
+        const laterInChain = allEventIds.has(replyTo);
+        return {
+          ...base,
+          verdict: 'invalid',
+          errors: [
+            replyReferenceError(
+              row,
+              laterInChain
+                ? `replyToEventId=${replyTo} 位于当前回复之后（禁止引用未来事件或自引用）`
+                : `replyToEventId=${replyTo} 不存在于当前 identity 事件链（可能属于其他 identity 或从未写入）`,
+            ),
+          ],
+        };
+      }
+      if (!seenUserInputIds.has(replyTo)) {
+        return {
+          ...base,
+          verdict: 'invalid',
+          errors: [
+            replyReferenceError(
+              row,
+              `replyToEventId=${replyTo} 指向的事件不是 DialogueEvent(user_input)`,
+            ),
+          ],
+        };
+      }
+    }
+
+    seenEventIds.add(row.event_id);
+    if (isUserInputRow(row)) seenUserInputIds.add(row.event_id);
+
     state = applyEvent(state, row.payload);
   }
 

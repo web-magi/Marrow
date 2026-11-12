@@ -63,7 +63,7 @@ test('垃圾输入：返回兜底结果（低置信 + unknown），绝不抛异�
   }
 });
 
-test('解析结果绝不包含主观情绪字段（moodDelta/valence 等）', () => {
+test('解析结果绝不包含 Marrow 状态效价字段（moodDelta 等）', () => {
   const raw = JSON.stringify({
     action: 'insult',
     intensity: 0.8,
@@ -77,9 +77,22 @@ test('解析结果绝不包含主观情绪字段（moodDelta/valence 等）', ()
   const result = parseExtraction(raw);
   const keys = Object.keys(result).sort();
 
-  assert.deepEqual(keys, ['action', 'confidence', 'facts', 'intensity', 'uncertainty']);
+  // M1.4.9：新增 status 与经历极性；M1.5.4.1：数值与状态必须成对出现，
+  // 本输入没有体验性质 → 只有状态（unknown），不再用 0 兜底。
+  // moodDelta / 对 Marrow 的效价仍不得出现在提取结果中
+  assert.deepEqual(keys, [
+    'action',
+    'confidence',
+    'experienceValenceStatus',
+    'facts',
+    'intensity',
+    'status',
+    'uncertainty',
+  ]);
+  assert.equal(result.experienceValenceStatus, 'unknown');
+  assert.equal(result.experienceValence, undefined);
   assert.ok(!('moodDelta' in result), '结果不得包含 moodDelta');
-  assert.ok(!('valence' in result), '结果不应包含 valence');
+  assert.ok(!('valence' in result), '结果不应包含对 Marrow 的 valence');
 });
 
 test('EXTRACTOR_VERSION 已导出且非空', () => {

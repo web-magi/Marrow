@@ -400,10 +400,152 @@ function walkStep(step: number, seed: string): number {
 }
 
 /**
- * 从对话文本中检索情景记忆
+ * 召回文本归一化（M1.4.8）
  *
- * 遍历 episodicBuffer，检查每条记忆的关键词是否出现在文本中。
- * 返回匹配度最高（显著性 × 关键词命中数）的记忆，若无匹配返回 null。
+ * 去掉标点、符号与空白，只保留文字与数字，用于消除纯格式差异：
+ * 「火锅！」「火 锅」「火锅，」归一化后都是「火锅」。
+ * 不做大小写折叠——保留既有的大小写敏感语义。
+ */
+function normalizeForRecall(text: string): string {
+  return text.replace(/[\p{P}\p{S}\s]/gu, '');
+}
+
+/**
+ * 部分匹配所需的最短公共子串长度（M1.4.8.1）
+ *
+ * - 用户明确在回忆过去（「你还记得…」）时 3 字即可，允许自然语言改写；
+ * - 普通陈述时要求至少 4 字，避免「心情不…」这类 3 字偶然片段
+ *   （甚至反义片段）单独触发召回。
+ */
+const MIN_PARTIAL_MATCH_CHARS = 3;
+const MIN_PARTIAL_MATCH_CHARS_STRICT = 4;
+
+/**
+ * 普通陈述（无回忆意图）下的最低匹配权重（M1.4.8.1）
+ *
+ * 0.45 + 0.55 × 覆盖率 >= 0.8 约等于关键词至少 64% 的连续覆盖，
+ * 只有这种强度的部分匹配才被视为「可靠证据」，同时也是
+ * 允许累加的最小单项权重（弱匹配不能叠加）。
+ */
+const STRONG_MATCH_WEIGHT = 0.8;
+
+/** 明确回忆意图下的最低匹配置信度（低于此值不召回） */
+const MIN_RECALL_CONFIDENCE = 0.5;
+
+/** 最低显著性：衰减到近乎为零的记忆不再参与召回 */
+const MIN_RECALL_SALIENCE = 1e-6;
+
+/**
+ * 回忆意图标记（M1.4.8.1）
+ *
+ * 只有用户明确指向过去经历时，才允许低覆盖率的部分匹配参与召回。
+ * 注意：「下次」是将来时，不算回忆意图。
+ */
+const RECALL_INTENT_PATTERN =
+  /记得|之前|以前|上次|那次|曾经|当时|那时候|那时|回忆|想起来|说过|当年/;
+
+/**
+ * 低信息量语用填充词
+ *
+ * 这些片段在对话里几乎不携带经历信息（「说实话」「我觉得」……），
+ * 即使精确命中也不能单独构成召回证据，否则任何闲聊都会唤醒旧记忆。
+ * 只收录 3 字及以上片段：2 字片段本来就不参与部分匹配。
+ */
+const LOW_INFORMATION_KEYWORDS: ReadonlySet<string> = new Set([
+  '说实话',
+  '说真的',
+  '我觉得',
+  '我感觉',
+  '我知道',
+  '其实我',
+  '然后呢',
+  '就是说',
+  '怎么说',
+  '总之',
+  '反正',
+  '可能吧',
+  '应该是',
+  '好像是',
+  '怎么说呢',
+]);
+
+/** 部分匹配只对中文短语生效（避免影响英文关键词的大小写语义） */
+const CJK_PATTERN = /[\u4e00-\u9fff]/;
+
+/**
+ * 最长公共子串长度（确定性 DP）
+ *
+ * 关键词通常不超过 20 字、单轮文本不超过数百字，逐关键词计算成本可忽略。
+ */
+function longestCommonSubstringLength(a: string, b: string): number {
+  if (a.length === 0 || b.length === 0) return 0;
+  let prev = new Array<number>(b.length + 1).fill(0);
+  let best = 0;
+  for (let i = 1; i <= a.length; i++) {
+    const curr = new Array<number>(b.length + 1).fill(0);
+    const charA = a[i - 1];
+    for (let j = 1; j <= b.length; j++) {
+      if (charA === b[j - 1]) {
+        const run = prev[j - 1]! + 1;
+        curr[j] = run;
+        if (run > best) best = run;
+      }
+    }
+    prev = curr;
+  }
+  return best;
+}
+
+/**
+ * 单个关键词对文本的匹配权重（0 表示不构成召回证据）
+ *
+ * 两级匹配：
+ * 1. 归一化后的精确子串命中 → 权重 1（最可靠的基础）
+ * 2. 中文短语最长公共子串达到门槛 → 权重 0.45 + 0.55 × 覆盖率
+ *    覆盖率 = 公共子串长度 / 关键词长度，部分命中永远低于 1
+ *
+ * 门槛由 strict 决定（M1.4.8.1）：
+ * - strict=false（用户有明确回忆意图）：公共子串 >= 3 字即可；
+ * - strict=true（普通陈述）：公共子串 >= 4 字，3 字偶然重叠不算证据。
+ *
+ * 低信息量填充词权重为 0；2 字短词不参与部分匹配，
+ * 因此「项目」「开心」「喜欢」这类常见短词不会被单独当作召回证据。
+ */
+function keywordMatchWeight(
+  keyword: string,
+  normalizedText: string,
+  strict: boolean,
+): number {
+  const kw = normalizeForRecall(keyword);
+  if (kw.length === 0) return 0;
+  if (LOW_INFORMATION_KEYWORDS.has(kw)) return 0;
+  if (normalizedText.includes(kw)) return 1;
+
+  const minChars = strict
+    ? MIN_PARTIAL_MATCH_CHARS_STRICT
+    : MIN_PARTIAL_MATCH_CHARS;
+  if (kw.length < minChars || !CJK_PATTERN.test(kw)) return 0;
+
+  const common = longestCommonSubstringLength(kw, normalizedText);
+  if (common < minChars) return 0;
+  return 0.45 + 0.55 * (common / kw.length);
+}
+
+/**
+ * 从对话文本中检索情景记忆（M1.4.8.1：精度校准版）
+ *
+ * 遍历 episodicBuffer，对每条记忆汇总关键词匹配权重：
+ * - 精确命中权重 1；中文短语部分命中 0.45~1；低信息量填充词不参与。
+ * - 用户有明确回忆意图（还记得/之前/上次…）时，接受 3 字以上部分匹配，
+ *   门槛 MIN_RECALL_CONFIDENCE=0.5；
+ * - 普通陈述时只接受可靠证据：精确命中或权重 >= STRONG_MATCH_WEIGHT=0.8
+ *   的部分命中（≈ 关键词 64% 连续覆盖）。
+ * - 只有强匹配（>= 0.8）才允许累加，多个弱匹配不能叠加越过门槛；
+ *   置信度 = max(最强单项, 强匹配之和)。
+ * - 显著性低于 MIN_RECALL_SALIENCE 的记忆不参评。
+ *
+ * 评分 = salience × 置信度，取唯一最高分；
+ * 同分时保留 buffer 中靠前者（严格大于比较），保证确定性。
  *
  * 记忆唤醒是潜意识的：一旦触发，直接影响 mood 和 energy，
  * 不受当前体力/注意力限制（回忆可以让人精神一振，也可以让人瞬间低落）。
@@ -414,26 +556,38 @@ export function evokeMemoryFromText(
   buffer: EpisodicMemory[],
   text: string,
 ): EpisodicMemory | null {
-  if (buffer.length === 0 || text.length === 0) return null;
+  if (buffer.length === 0) return null;
+  const normalizedText = normalizeForRecall(text);
+  if (normalizedText.length === 0) return null;
+
+  // 回忆意图决定部分匹配门槛：没有意图时只接受强证据
+  const hasRecallIntent = RECALL_INTENT_PATTERN.test(normalizedText);
+  const confidenceThreshold = hasRecallIntent
+    ? MIN_RECALL_CONFIDENCE
+    : STRONG_MATCH_WEIGHT;
 
   let best: EpisodicMemory | null = null;
   let bestScore = 0;
 
   for (const mem of buffer) {
-    let hitCount = 0;
+    if (mem.salience < MIN_RECALL_SALIENCE) continue;
+
+    let strongest = 0;
+    let strongSum = 0;
     for (const kw of mem.keywords) {
-      if (text.includes(kw)) {
-        hitCount++;
-      }
+      const weight = keywordMatchWeight(kw, normalizedText, !hasRecallIntent);
+      if (weight > strongest) strongest = weight;
+      // 只有强匹配允许累加：弱匹配只能作为单项证据，不能相互叠加
+      if (weight >= STRONG_MATCH_WEIGHT) strongSum += weight;
     }
-    if (hitCount > 0) {
-      // 匹配分数 = 显著性 × 命中关键词数
-      // 显著性越高、命中越多，越可能被唤醒
-      const score = mem.salience * hitCount;
-      if (score > bestScore) {
-        bestScore = score;
-        best = mem;
-      }
+    const confidence = Math.max(strongest, strongSum);
+    if (confidence < confidenceThreshold) continue;
+
+    // 评分 = 显著性 × 匹配置信度（强匹配可叠加置信度）
+    const score = mem.salience * confidence;
+    if (score > bestScore) {
+      bestScore = score;
+      best = mem;
     }
   }
 
@@ -457,30 +611,34 @@ function extractKeywords(text: string, maxTokens = 6): string[] {
 /**
  * extractEpisodicMemory —— EpisodicMemory 形成门槛判断 + 构造（纯函数）
  *
- * 将 applyDialogue 内联的记忆沉淀逻辑封装为独立函数，供两个调用方使用：
- *   1. index.ts handleChatRequest —— 判断是否创建 MemoryFormationEvent
- *   2. applyDialogue              —— 保留调用点以便未来状态变化时可恢复
- *
- * 门槛（M1.4.1 不调整阈值，与 applyDialogue 旧逻辑完全一致）：
+ * 门槛（M1.4.8：只看当前输入自身产生的情绪依据）：
  *   intensity >= 0.5
- *   |weightedMoodDelta + memoryMoodDelta| >= 1.0
+ *   |weightedMoodDelta| >= 1.0
  *   extractKeywords(text).length > 0
+ *
+ * memoryMoodDelta 不再参与门槛与效价：
+ * 召回旧记忆可以改变当前 mood/energy（由 applyDialogue 负责），
+ * 但那是"回忆"而不是"新经历"，不能据此沉淀一条新记忆，
+ * 否则每次回忆都会复制历史记忆（M1.4.7.1 发现的记忆回声问题）。
+ *
+ * M1.4.9：记忆效价只来自用户经历本身（experienceValence），
+ * 不再用 weightedMoodDelta 的符号推导——后者是 Marrow 对"回应动作"的
+ * appraisal 结果（comfort 天然为正），用它决定记忆颜色会把"安慰"误记成
+ * "用户的经历是积极的"。experienceValence 缺失/非有限值时按 0（中性或
+ * 信息不足）落库，绝不推测。
  *
  * 不满足条件返回 null。满足条件返回完整 EpisodicMemory 对象。
  */
 export function extractEpisodicMemory(
   event: DialogueEvent,
   weightedMoodDelta: number,
-  memoryMoodDelta: number,
+  experienceValence = 0,
 ): EpisodicMemory | null {
   const { action, intensity, text } = event.payload;
   const { id, timestamp } = event;
   if (action === undefined || intensity === undefined) return null;
 
-  if (
-    intensity >= 0.5 &&
-    Math.abs(weightedMoodDelta + memoryMoodDelta) >= 1.0
-  ) {
+  if (intensity >= 0.5 && Math.abs(weightedMoodDelta) >= 1.0) {
     const keywords = extractKeywords(text);
     if (keywords.length === 0) return null;
 
@@ -489,7 +647,10 @@ export function extractEpisodicMemory(
       timestamp,
       summary: text.slice(0, 40),
       keywords,
-      valence: weightedMoodDelta + memoryMoodDelta > 0 ? 0.6 : -0.6,
+      // 效价只来自用户经历本身；与 action / moodDelta 的符号完全解耦
+      valence: Number.isFinite(experienceValence)
+        ? clamp(experienceValence, -1, 1)
+        : 0,
       salience: intensity,
       sourceEventId: id,
       isTrauma: action === 'insult' && intensity >= 0.7,
@@ -501,34 +662,41 @@ export function extractEpisodicMemory(
 /**
  * computeEpisodicMemoryCandidate —— EpisodicMemory 完整候选计算（单一入口）
  *
- * 封装 weightedMoodDelta + memoryMoodDelta + extractEpisodicMemory 三步
- * 计算，避免 index.ts 和 state.ts 分别维护同一套公式（M1.4.1.1 修复）。
+ * 封装 attention 加权 + extractEpisodicMemory 两步计算，
+ * 避免 index.ts 和 state.ts 分别维护同一套公式（M1.4.1.1 修复）。
  *
  * 输入：
  *   state    —— 当前运行时状态（用于 attentionFocus / traits.neuroticism）
  *   event    —— DialogueEvent（user_input 方向才可能形成记忆）
- *   evoked   —— evokeMemoryFromText 结果（已由调用方提前检索）
  *   baseValenceDelta —— 效价增量来源（新格式 = payload.moodDelta；
  *                        旧格式需重新 appraise——当前生产链只有新格式）
+ *   experienceValence —— 用户经历本身的情绪极性（-1..1，来自提取结果）；
+ *                        缺失时按 0 处理，绝不从 action/moodDelta 推导
+ *
+ * M1.4.8：召回旧记忆产生的 memoryMoodDelta 不进入本函数。
+ * 它仍由 applyDialogue 应用到 mood/energy/cognitiveLoad（回忆会影响当下），
+ * 但"回忆旧记忆"不能成为"形成新记忆"的情绪依据。
+ *
+ * M1.4.9：action='unknown' 表示提取不可信，不得沉淀为历史事实。
  *
  * 输出：满足沉淀门槛 → EpisodicMemory；否则 null。
  *
- * 公式（与 applyDialogue 内部 L900-960 完全一致，单一来源）：
+ * 公式：
  *   attentionMod  = 0.3 + state.attentionFocus * 0.7
  *   weightedMoodDelta = baseValenceDelta * attentionMod
  *                     × (weightedMoodDelta < 0 ? state.traits.neuroticism : 1)
- *   memoryMoodDelta   = evoked.valence * evoked.salience * 8
- *                     × (evoked.isTrauma ? 1.5 : 1)
  */
 export function computeEpisodicMemoryCandidate(
   state: MarrowState,
   event: DialogueEvent,
-  evoked: EpisodicMemory | null,
   baseValenceDelta: number,
+  experienceValence = 0,
 ): EpisodicMemory | null {
   if (event.payload.direction !== 'user_input') return null;
   const { action, intensity } = event.payload;
   if (action === undefined || intensity === undefined) return null;
+  // 提取层无法判断行为类型时，不允许把不确定的经历写成确定记忆
+  if (action === 'unknown') return null;
 
   const attentionMod = 0.3 + state.attentionFocus * 0.7;
   let weightedMoodDelta = baseValenceDelta * attentionMod;
@@ -536,13 +704,7 @@ export function computeEpisodicMemoryCandidate(
     weightedMoodDelta *= state.traits.neuroticism;
   }
 
-  let memoryMoodDelta = 0;
-  if (evoked) {
-    memoryMoodDelta = evoked.valence * evoked.salience * STATE_CONSTANTS.MEMORY_MOOD_IMPACT;
-    if (evoked.isTrauma) memoryMoodDelta *= 1.5;
-  }
-
-  return extractEpisodicMemory(event, weightedMoodDelta, memoryMoodDelta);
+  return extractEpisodicMemory(event, weightedMoodDelta, experienceValence);
 }
 
 /**

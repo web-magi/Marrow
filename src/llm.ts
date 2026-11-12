@@ -13,6 +13,10 @@
 
 import type { MarrowState } from './state.js';
 import type { DialogueAction, PersonalityTraits } from './events.js';
+import {
+  normalizeExperienceValence,
+  type ExperienceValenceStatus,
+} from './experience-valence.js';
 
 /** 传递给 LLM 的状态快照（精简版，不含内部字段） */
 export interface StateSnapshot {
@@ -108,16 +112,37 @@ export interface CandidateBehavior {
  * 写入 ObservationEvent.extractorVersion，回放时按版本兼容旧格式。
  * 提取 prompt 或解析规则变化时递增。
  */
-export const EXTRACTOR_VERSION = 'extractor-1.1';
+export const EXTRACTOR_VERSION = 'extractor-1.4';
 
 /**
- * 提取结果（纯观察，不含任何主观情绪字段）
+ * 提取状态（M1.4.9）
  *
- * 严格约束：只允许 action/intensity/confidence/facts/uncertainty 五个字段。
- * 绝不包含 moodDelta/valence 等主观效价——那是 appraisal.ts 的职责。
+ * - success：找到唯一完整 JSON，且关键字段通过 schema 校验
+ * - invalid_json：没有可解析的完整 JSON（空内容/截断/文本残片）
+ * - invalid_schema：JSON 可解析，但关键字段缺失或类型错误
+ * - ambiguous_output：同一响应里出现多个顶层 JSON 对象，无法确定哪个是提取结果
+ *
+ * 非 success 的结果只允许驱动“对话文本”，不得驱动记忆形成。
+ */
+export type ExtractionStatus =
+  | 'success'
+  | 'invalid_json'
+  | 'invalid_schema'
+  | 'ambiguous_output';
+
+/**
+ * 提取结果（纯观察）
+ *
+ * 字段边界（M1.4.9 起）：
+ * - action/intensity：Marrow 的对话回应行为及其强度，由 LLM 观察 + 关键词安全网校正；
+ * - experienceValence：用户所描述“经历本身”的情绪极性（-1..1），
+ *   与回应动作严格解耦——安慰负面经历不代表经历是正面的；
+ * - 绝不包含 moodDelta 等“对 Marrow 状态的影响”——那是 appraisal.ts 的职责。
  */
 export interface ExtractionResult {
-  /** 客观行为类型 */
+  /** 解析状态：只有 success 才可进入记忆形成 */
+  status: ExtractionStatus;
+  /** 客观行为类型（Marrow 的回应行为，不代表用户经历的极性） */
   action: DialogueAction;
   /** 客观强度 0-1 */
   intensity: number;
@@ -127,70 +152,198 @@ export interface ExtractionResult {
   facts: Array<{ claim: string; confidence: number }>;
   /** 不确定性 0-1（与 confidence 互补） */
   uncertainty: number;
+  /**
+   * 用户经历本身的情绪极性 -1..1（M1.5.4.1）
+   *
+   * 只在 experienceValenceStatus 为 observed/neutral/mixed 时存在。
+   * 缺失表示没有可解释的数值（unknown 或 extraction_failed），
+   * 不再用 0 兜底——0 只表示"真实中性"。
+   */
+  experienceValence?: number;
+  /**
+   * 体验性质状态（五态，定义见 experience-valence.ts）
+   *
+   * 新事件必须写入；旧事件缺少该字段表示"不可用"，不等于 unknown。
+   */
+  experienceValenceStatus: ExperienceValenceStatus;
 }
 
 /** 解析失败时的兜底提取结果：低置信 + 高不确定性，绝不伪造高置信度 */
-const EXTRACTION_FALLBACK: ExtractionResult = {
-  action: 'unknown',
-  intensity: 0.3,
-  confidence: 0.2,
-  facts: [],
-  uncertainty: 0.8,
-};
+function extractionFailure(status: ExtractionStatus): ExtractionResult {
+  return {
+    status,
+    action: 'unknown',
+    intensity: 0.3,
+    confidence: 0.2,
+    facts: [],
+    uncertainty: 0.8,
+    // 提取失败不得伪装成中性：不写数值，只标记失败状态
+    experienceValenceStatus: 'extraction_failed',
+  };
+}
 
 /** 将数值 clamp 到 [0, 1]（非数值回退为默认值） */
 function clamp01(value: unknown, fallback: number): number {
-  if (typeof value !== 'number' || Number.isNaN(value)) return fallback;
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
   return Math.max(0, Math.min(1, value));
+}
+
+/**
+ * 扫描文本中的所有“顶层完整 JSON 对象”（M1.4.9）
+ *
+ * 只按括号深度 0 → 0 的边界切分，字符串内部的花括号不计数。
+ * - 代码围栏、JSON 前后的说明文字不会影响边界；
+ * - 未闭合的 `{` 不会产出候选（截断 JSON 视为解析失败）；
+ * - 多个顶层对象会产出多个候选，由调用方判定为歧义；
+ * - 不做任何拼接、补全或正则修复（避免把残片伪装成合法 JSON）。
+ */
+function findTopLevelJsonObjects(raw: string): string[] {
+  const objects: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]!;
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === '}') {
+      if (depth > 0) {
+        depth--;
+        if (depth === 0 && start >= 0) {
+          objects.push(raw.slice(start, i + 1));
+          start = -1;
+        }
+      }
+    }
+  }
+  return objects;
+}
+
+/**
+ * 记忆形成准入判断（M1.4.9）
+ *
+ * 只有“解析成功且行为类型可判定”的提取结果，才允许驱动记忆形成。
+ * 解析失败（invalid_json / invalid_schema / ambiguous_output）时，
+ * 原始 DialogueEvent 仍然保留，但不得把不确定的提取写成确定的历史事实。
+ */
+export function isMemoryFormationEligible(extraction: ExtractionResult): boolean {
+  return extraction.status === 'success' && extraction.action !== 'unknown';
 }
 
 /**
  * 从 LLM 原始输出中解析提取结果（纯函数，绝不抛异常）
  *
- * 严格 schema 校验：
- * - action 必须在 DialogueAction 枚举内，缺失/非法 → 整体回退到底兜结果
- *   （没有可靠的行为类型时，置信度一文不值，绝不伪造）
- * - intensity/confidence/uncertainty clamp 到 [0,1]，缺失时取保守默认值
- * - facts 过滤掉非法项（非对象、claim 非字符串或为空）
- * - JSON 解析失败 → 兜底结果
+ * 解析策略（M1.4.9）：
+ * - 只接受“唯一一个完整顶层 JSON 对象”，允许其前后存在说明文字或代码围栏；
+ * - 空内容、无 JSON、截断 JSON → invalid_json；
+ * - 多个顶层 JSON 对象 → ambiguous_output（不随机挑选）；
+ * - action 缺失/非法、关键字段类型错误 → invalid_schema；
+ * - 可选字段缺失时取保守默认值（intensity=0.3、confidence=0.5）；
+ * - experienceValence 缺失不再是 0：按 experienceValenceStatus 归一化，
+ *   unknown / extraction_failed 不携带数值（M1.5.4.1）；
+ * - facts 必须是数组，非法条目被过滤（不伪造 claim）。
+ *
+ * 任何失败都返回明确 status，绝不用兜底值伪装成可信提取。
  */
 export function parseExtraction(raw: string): ExtractionResult {
+  const trimmed = typeof raw === 'string' ? raw.trim() : '';
+  if (!trimmed) return extractionFailure('invalid_json');
+
+  const candidates = findTopLevelJsonObjects(trimmed);
+  if (candidates.length === 0) return extractionFailure('invalid_json');
+  if (candidates.length > 1) return extractionFailure('ambiguous_output');
+
+  let parsed: unknown;
   try {
-    // 容错：LLM 可能输出带 markdown 代码块或额外文字的 JSON
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    const jsonStr = jsonMatch ? jsonMatch[0] : raw;
-    const parsed = JSON.parse(jsonStr) as Record<string, unknown>;
+    parsed = JSON.parse(candidates[0]!);
+  } catch {
+    return extractionFailure('invalid_json');
+  }
 
-    const rawAction = typeof parsed.action === 'string' ? parsed.action : '';
-    if (!VALID_ACTIONS.has(rawAction as DialogueAction)) {
-      // 行为类型是提取的核心：缺失或非法时整体兜底，绝不伪造置信度
-      return { ...EXTRACTION_FALLBACK, facts: [] };
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return extractionFailure('invalid_schema');
+  }
+  const obj = parsed as Record<string, unknown>;
+
+  const rawAction = typeof obj.action === 'string' ? obj.action : '';
+  if (!VALID_ACTIONS.has(rawAction as DialogueAction)) {
+    // 行为类型是提取的核心：缺失或非法时明确失败，绝不伪造置信度
+    return extractionFailure('invalid_schema');
+  }
+  const action = rawAction as DialogueAction;
+
+  // 关键数值字段：允许缺失（取默认值），但一旦出现必须是有限数值
+  for (const key of ['intensity', 'confidence', 'uncertainty'] as const) {
+    const value = obj[key];
+    if (value !== undefined && (typeof value !== 'number' || !Number.isFinite(value))) {
+      return extractionFailure('invalid_schema');
     }
-    const action = rawAction as DialogueAction;
+  }
+  // 经历效价是记忆极性来源：类型错误必须拒绝，不能静默按中性处理
+  if (
+    obj.experienceValence !== undefined &&
+    (typeof obj.experienceValence !== 'number' || !Number.isFinite(obj.experienceValence))
+  ) {
+    return extractionFailure('invalid_schema');
+  }
+  // facts 必须是数组；数组内非法条目过滤（不补全、不伪造）
+  if (obj.facts !== undefined && !Array.isArray(obj.facts)) {
+    return extractionFailure('invalid_schema');
+  }
 
-    const intensity = clamp01(parsed.intensity, 0.3);
-    const confidence = clamp01(parsed.confidence, 0.5);
-    const uncertainty = clamp01(parsed.uncertainty, 1 - confidence);
+  const intensity = clamp01(obj.intensity, 0.3);
+  const confidence = clamp01(obj.confidence, 0.5);
+  const uncertainty = clamp01(obj.uncertainty, 1 - confidence);
 
-    const facts: Array<{ claim: string; confidence: number }> = [];
-    if (Array.isArray(parsed.facts)) {
-      for (const item of parsed.facts) {
-        if (item && typeof item === 'object') {
-          const claim = (item as Record<string, unknown>).claim;
-          if (typeof claim === 'string' && claim.length > 0) {
-            facts.push({
-              claim,
-              confidence: clamp01((item as Record<string, unknown>).confidence, 0.5),
-            });
-          }
+  const facts: Array<{ claim: string; confidence: number }> = [];
+  if (Array.isArray(obj.facts)) {
+    for (const item of obj.facts) {
+      if (item && typeof item === 'object') {
+        const claim = (item as Record<string, unknown>).claim;
+        if (typeof claim === 'string' && claim.length > 0) {
+          facts.push({
+            claim,
+            confidence: clamp01((item as Record<string, unknown>).confidence, 0.5),
+          });
         }
       }
     }
-
-    return { action, intensity, confidence, facts, uncertainty };
-  } catch {
-    return { ...EXTRACTION_FALLBACK, facts: [] };
   }
+
+  // M1.5.4.1：体验性质必须与状态一起解释。
+  // 归一化只做一致性判定与降级，不做关键词补全，也不 clamp 越界值——
+  // 矛盾或越界一律降级为 unknown（不携带数值），绝不猜测。
+  const experienceObservation = normalizeExperienceValence({
+    rawValue: obj.experienceValence,
+    rawStatus: obj.experienceValenceStatus,
+    extractionSucceeded: true,
+  });
+
+  return {
+    status: 'success',
+    action,
+    intensity,
+    confidence,
+    facts,
+    uncertainty,
+    experienceValenceStatus: experienceObservation.status,
+    ...(experienceObservation.value !== undefined
+      ? { experienceValence: experienceObservation.value }
+      : {}),
+  };
 }
 
 /** LLM 客户端接口 */
@@ -565,9 +718,34 @@ class RealLLMClient implements LLMClient {
       `强度是 0 到 1 之间的数字，侮辱和赞美通常强度较高。\n` +
       `confidence 是你对本次提取的置信度（0-1）；uncertainty 是你对用户意图的不确定性（0-1）。\n` +
       `facts 是用户话语中的客观事实主张列表（如"用户提到了火锅"），每条带独立 confidence（0-1）。\n` +
-      `绝对不要输出任何情绪效价字段（如 moodDelta、valence）——情绪由系统计算，不由你决定。\n\n` +
-      `必须只输出 JSON，格式如下，不要有其他文字：\n` +
-      `{"text": "你的回复", "action": "行为类型", "intensity": 0.5, "confidence": 0.8, "facts": [{"claim": "客观事实", "confidence": 0.9}], "uncertainty": 0.2}`;
+      `experienceValence 是你对【用户所描述的这段经历本身】的情绪极性观察，范围 -1 到 1。\n` +
+      `experienceValenceStatus 是这个观察的判断状态，只能是以下四种之一：\n` +
+      `- observed：有明确单一方向。此时 experienceValence 必须是 -1 到 1 之间的非 0 数值。\n` +
+      `- neutral：经历本身没有正负之分。此时 experienceValence 必须是 0。\n` +
+      `- mixed：同时存在明显正负感受。此时 experienceValence 可以是 0 或轻微偏向某一方。\n` +
+      `- unknown：成功读懂了话语，但无法判断经历的体验性质。此时不要输出 experienceValence 字段。\n` +
+      `判断对象是用户自己的经历与感受，不是你的回应方式，也不是你自身状态的变化。\n` +
+      `判为负面的依据：用户明确表达压力很大、担心、害怕、焦虑、失望、难过、痛苦、无助、因事情失眠或持续困扰等。\n` +
+      `如果用户同时描述了客观困难，又明确表达了上述负面感受，必须判为负面；不要因为没出现"难过""伤心"等词就输出 0。\n` +
+      `判为正面的依据：用户明确表达开心、幸福、满足、兴奋、自豪、轻松、感到被支持等。\n` +
+      `判为中性的情形：只描述客观事实或日常事务、没有表达个人感受时输出 0；只是工作忙、事情多、遇到困难但没有表达感受，也输出 0。\n` +
+      `混合情绪：同时存在明显正负感受时输出接近 0 的值；某一方向明显占主导时可略偏正或略偏负，不得只取其中一种情绪。\n` +
+      `参考强度（不是硬阈值）：-1.0~-0.7 强烈负面，-0.7~-0.3 明显负面，-0.3~-0.1 轻微负面，-0.1~+0.1 中性或无法判断，` +
+      `+0.1~+0.3 轻微正面，+0.3~+0.7 明显正面，+0.7~+1.0 强烈正面；真实情绪强烈时直接输出 -1 或 +1。\n` +
+      `三个维度互相独立，禁止相互推导：action=comfort 不代表用户经历是负面的；action=compliment 不代表用户经历是正面的；` +
+      `你心情变好不代表用户经历正面；你心情变差也不代表用户经历负面。同一段用户经历换一种回应方式，experienceValence 不应改变。\n` +
+      `绝对不要输出对你自己情绪状态的影响字段（如 moodDelta）——那是系统计算的，不由你决定。\n\n` +
+      `[JSON 输出规则]\n` +
+      `1. 只输出一个顶层 JSON 对象，前后不要输出任何解释文字，不要使用 Markdown 代码围栏。\n` +
+      `2. 所有字段必须属于同一个顶层对象：action、intensity、confidence、facts、experienceValence、experienceValenceStatus、uncertainty 都在顶层。\n` +
+      `3. facts 必须是数组，每个元素必须是独立对象 {"claim": "...", "confidence": 0.9}，不允许多个对象共用一个 confidence。\n` +
+      `4. 不允许在 facts 数组关闭（]）之后再补任何属于 fact 的字段；不要输出注释、尾随逗号或第二个 JSON 对象。\n` +
+      `5. 字段顺序不限。下面五个示例只演示结构，experienceValence 与 action 没有对应关系：\n` +
+      `负面：{"text": "听起来压力很大，我在。", "action": "comfort", "intensity": 0.7, "confidence": 0.85, "facts": [{"claim": "用户加班且担心做不好", "confidence": 0.9}], "experienceValence": -0.8, "experienceValenceStatus": "observed", "uncertainty": 0.2}\n` +
+      `正面：{"text": "听起来真不错。", "action": "compliment", "intensity": 0.6, "confidence": 0.85, "facts": [{"claim": "用户喝到咖啡感到幸福", "confidence": 0.9}], "experienceValence": 0.8, "experienceValenceStatus": "observed", "uncertainty": 0.1}\n` +
+      `中性：{"text": "嗯，我知道了。", "action": "statement", "intensity": 0.4, "confidence": 0.85, "facts": [{"claim": "用户中午吃了饭", "confidence": 0.9}], "experienceValence": 0, "experienceValenceStatus": "neutral", "uncertainty": 0.2}\n` +
+      `混合：{"text": "完成了真好，也辛苦你了。", "action": "statement", "intensity": 0.6, "confidence": 0.85, "facts": [{"claim": "项目完成但过程很累", "confidence": 0.9}], "experienceValence": 0.1, "experienceValenceStatus": "mixed", "uncertainty": 0.25}\n` +
+      `无法判断：{"text": "嗯。", "action": "statement", "intensity": 0.3, "confidence": 0.6, "facts": [], "experienceValenceStatus": "unknown", "uncertainty": 0.5}`;
 
     const userPrompt = `[用户说]\n${userInput}\n\n输出 JSON：`;
 
@@ -642,6 +820,9 @@ function correctExtractionByKeywords(
   text: string,
   extraction: ExtractionResult,
 ): ExtractionResult {
+  // M1.4.9：解析失败时不得用关键词凭空补出 action/intensity——
+  // 那会把“不确定的解析结果”伪装成可信提取。校正只作用于成功解析的结果。
+  if (extraction.status !== 'success') return extraction;
   const confident = (e: ExtractionResult): ExtractionResult =>
     e.confidence < 0.6 ? { ...e, confidence: 0.6 } : e;
   // 强侮辱关键词 → 强制 insult
@@ -816,11 +997,14 @@ class MockLLMClient implements LLMClient {
     // 落默认 statement 时置信度较低（没有真实语义理解）
     const confidence = action === 'statement' ? 0.4 : 0.6;
     const extraction: ExtractionResult = {
+      status: 'success',
       action,
       intensity,
       confidence,
       facts: [],
       uncertainty: 1 - confidence,
+      // mock 不做经历极性判断：既不输出数值，也不声称中性 → unknown
+      experienceValenceStatus: 'unknown',
     };
 
     return { text, action, intensity, extraction };

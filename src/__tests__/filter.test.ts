@@ -27,7 +27,15 @@ function makeCandidate(text: string, action: CandidateBehavior['action']): Candi
     text,
     action,
     intensity: 0.5,
-    extraction: { action, intensity: 0.5, confidence: 0.6, facts: [], uncertainty: 0.4 },
+    extraction: {
+      status: 'success',
+      action,
+      intensity: 0.5,
+      confidence: 0.6,
+      facts: [],
+      uncertainty: 0.4,
+      experienceValenceStatus: 'unknown',
+    },
   };
 }
 

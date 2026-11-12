@@ -137,13 +137,12 @@ test('[A5] salience 为 0 的记忆不会被召回', () => {
   assert.equal(evokeMemoryFromText([zero, unrelated], '火锅'), null);
 });
 
-test('[A6] salience 为 1e-12 时仍可召回（无最低阈值）', () => {
+test('[A6] salience 低于最低召回门槛（1e-6）时不再召回', () => {
   const tiny = makeMemory({ id: 'mem-tiny', keywords: ['火锅'], salience: 1e-12 });
+  const valid = makeMemory({ id: 'mem-valid', keywords: ['火锅'], salience: 1e-3 });
 
-  const recalled = evokeMemoryFromText([tiny], '火锅');
-
-  assert.notEqual(recalled, null, '当前实现无最低 salience 召回门槛');
-  assert.equal(recalled!.id, 'mem-tiny');
+  assert.equal(evokeMemoryFromText([tiny], '火锅'), null, 'M1.4.8 起设最低显著性门槛');
+  assert.equal(evokeMemoryFromText([valid], '火锅')!.id, 'mem-valid');
 });
 
 test('[A7] 多条记忆同时命中时最多返回一条', () => {
@@ -187,10 +186,19 @@ test('[B2] 大小写敏感：关键词「Coffee」不命中「coffee」', () => 
   assert.equal(evokeMemoryFromText([mem], 'Coffee')!.id, 'mem-b2');
 });
 
-test('[B3] 整段短语匹配：「今天天气真好」不命中「今天天气不错」', () => {
+test('[B3] 无关短语不命中：「今天天气真好」不命中「明天要开会」', () => {
   const mem = makeMemory({ id: 'mem-b3', keywords: ['今天天气真好'] });
 
-  assert.equal(evokeMemoryFromText([mem], '今天天气不错'), null);
+  assert.equal(evokeMemoryFromText([mem], '明天要开会'), null);
+});
+
+test('[B9] 中文近似短语可命中：「今天天气真好」命中「今天天气不错」', () => {
+  const mem = makeMemory({ id: 'mem-b9', keywords: ['今天天气真好'] });
+
+  // 公共子串「今天天气」= 4 字，覆盖率 4/6 → 部分匹配权重 0.82
+  const recalled = evokeMemoryFromText([mem], '今天天气不错');
+
+  assert.equal(recalled!.id, 'mem-b9', 'M1.4.8 支持中文短语改写召回');
 });
 
 test('[B4] 标点不阻止子串命中：关键词「火锅」命中「火锅！」', () => {
@@ -266,7 +274,7 @@ test('[B8] 形成记忆时 keywords 去重且不超过 6 个', () => {
     { intensity: 1.0 },
   );
 
-  const memory = extractEpisodicMemory(event, 2.0, 0);
+  const memory = extractEpisodicMemory(event, 2.0);
 
   assert.notEqual(memory, null);
   const keywords = memory!.keywords;
@@ -365,18 +373,21 @@ test('[C4] 负向非 trauma 记忆拉低 mood，但不增加 trauma cognitiveLoa
   assert.equal(loadDiff, 0, '非 trauma 负向记忆不应增加 trauma cognitiveLoad');
 });
 
-test('[C5] memoryMoodDelta 参与新记忆形成门槛计算', () => {
+test('[C5] 召回旧记忆不再参与新记忆形成门槛（M1.4.8）', () => {
   const state = createInitialState(T0); // attentionFocus=0.5 → attentionMod=0.65
   const event = makeUserDialogue('evt-c5', '火锅真好吃', {
     intensity: 0.9,
     action: 'statement',
   });
 
-  // baseValenceDelta=1.0 → weightedMoodDelta=0.65 < 1.0，单独不足门槛
-  const withoutMemory = computeEpisodicMemoryCandidate(state, event, null, 1.0);
-  assert.equal(withoutMemory, null, '无记忆唤醒时不应越过形成门槛');
+  // baseValenceDelta=1.0 → weightedMoodDelta=0.65 < 1.0，当前输入自身不足门槛
+  assert.equal(
+    computeEpisodicMemoryCandidate(state, event, 1.0),
+    null,
+    '当前输入自身情绪不足时不应形成记忆',
+  );
 
-  // 唤醒正向记忆后 memoryMoodDelta 抬升加权和，越过 1.0 门槛
+  // 即使 buffer 中存在高显著性、可被当前文本召回的记忆，也不得越过门槛
   const evoked = makeMemory({
     id: 'mem-c5',
     keywords: ['火锅'],
@@ -384,9 +395,32 @@ test('[C5] memoryMoodDelta 参与新记忆形成门槛计算', () => {
     salience: 0.9,
     isTrauma: false,
   });
-  const withMemory = computeEpisodicMemoryCandidate(state, event, evoked, 1.0);
+  assert.equal(evokeMemoryFromText([evoked], event.payload.text)!.id, 'mem-c5');
+  assert.equal(
+    computeEpisodicMemoryCandidate(state, event, 1.0),
+    null,
+    'memoryMoodDelta 不得单独触发新记忆（只影响状态，不影响形成）',
+  );
+});
 
-  assert.notEqual(withMemory, null, 'memoryMoodDelta 应帮助越过形成门槛');
-  assert.equal(withMemory!.valence, 0.6, '净效价为正 → 新记忆 valence 应为 +0.6');
-  assert.equal(withMemory!.salience, event.payload.intensity);
+test('[C6] 当前输入自身情绪足够时仍可正常形成记忆', () => {
+  const state = createInitialState(T0);
+
+  const positive = makeUserDialogue('evt-c6a', '火锅真好吃', {
+    intensity: 0.9,
+    action: 'statement',
+  });
+  // baseValenceDelta=2.0 → weightedMoodDelta=1.3 >= 1.0
+  // M1.4.9：效价来自经历本身，不再由 baseValenceDelta 的符号推导
+  const mem = computeEpisodicMemoryCandidate(state, positive, 2.0, 0.6);
+  assert.notEqual(mem, null, '当前经历自身达到阈值时应正常形成');
+  assert.equal(mem!.valence, 0.6);
+
+  const negative = makeUserDialogue('evt-c6b', '火锅真难吃', {
+    intensity: 0.9,
+    action: 'complaint',
+  });
+  const negMem = computeEpisodicMemoryCandidate(state, negative, -2.0, -0.6);
+  assert.notEqual(negMem, null, '负向当前经历同样应正常形成');
+  assert.equal(negMem!.valence, -0.6);
 });

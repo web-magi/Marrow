@@ -52,6 +52,7 @@ import {
 import {
   createLLMClient,
   buildStateSnapshot,
+  isMemoryFormationEligible,
   EXTRACTOR_VERSION,
   type LLMClient,
   type ExtractionResult,
@@ -62,7 +63,7 @@ import {
   loadRecentDialogueHistory,
 } from './dialogue-context.js';
 import { appraise, type AppraisalContext } from './appraisal.js';
-import { filterCandidateBehavior } from './dialogue.js';
+import { filterCandidateBehavior, buildCompanionOutputEvent } from './dialogue.js';
 import type {
   DialogueEvent,
   MemoryFormationEvent,
@@ -351,20 +352,27 @@ async function handleChatRequest(
       const timestamp = stamp();
 
     // 2. 构建观察事件（纯事实记录，不驱动状态变化）
+    //    M1.5.4.1：体验性质与状态一起冻结；unknown / extraction_failed 不写数值，
+    //    避免把"无法判断/提取失败"退化成可被误读为真实中性的 0。
+    const observationPayload: ObservationEvent['payload'] = {
+      source: 'user_text',
+      content: userInput,
+      action: candidate.extraction.action,
+      intensity: candidate.extraction.intensity,
+      confidence: candidate.extraction.confidence,
+      uncertainty: candidate.extraction.uncertainty,
+      facts: candidate.extraction.facts,
+      extractorVersion: EXTRACTOR_VERSION,
+      experienceValenceStatus: candidate.extraction.experienceValenceStatus,
+    };
+    if (candidate.extraction.experienceValence !== undefined) {
+      observationPayload.experienceValence = candidate.extraction.experienceValence;
+    }
     const observationEvent: ObservationEvent = {
       type: 'observation',
       id: generateEventId(),
       timestamp,
-      payload: {
-        source: 'user_text',
-        content: userInput,
-        action: candidate.extraction.action,
-        intensity: candidate.extraction.intensity,
-        confidence: candidate.extraction.confidence,
-        uncertainty: candidate.extraction.uncertainty,
-        facts: candidate.extraction.facts,
-        extractorVersion: EXTRACTOR_VERSION,
-      },
+      payload: observationPayload,
     };
     const stateAfterObservation = applyEvent(state, observationEvent);
 
@@ -432,16 +440,28 @@ async function handleChatRequest(
     // ══════════════════════════════════════════════════════════════════
     // M1.4.1：EpisodicMemory 事件化 —— 创建 MemoryFormationEvent
     //
-    // 单一计算入口：computeEpisodicMemoryCandidate(state, event, evoked, baseValence)
-    // 内部封装 weightedMoodDelta + memoryMoodDelta + 沉淀门槛 + 记忆构造
-    // 避免 index.ts 与 state.ts 分别维护同一套公式
+    // 单一计算入口：computeEpisodicMemoryCandidate(state, event, baseValence, experienceValence)
+    // 内部封装 attention 加权 + 沉淀门槛 + 记忆构造
+    // M1.4.8：召回旧记忆的 memoryMoodDelta 只影响当前状态（applyDialogue），
+    // 不参与形成门槛——回忆不能被当成一段新经历重复沉淀。
+    // M1.4.9：只有提取成功（status=success）才允许形成记忆；
+    // 记忆效价来自 experienceValence（用户经历本身），不再由回应动作推导。
+    // 解析失败时仍保留本轮原始 DialogueEvent，只是不沉淀记忆。
     // ══════════════════════════════════════════════════════════════════
-    const formedMem = computeEpisodicMemoryCandidate(
-      stateAfterAppraisal,
-      userEvent,
-      evoked,
-      userEvent.payload.moodDelta ?? 0,
-    );
+    const eligibleForMemory = isMemoryFormationEligible(candidate.extraction);
+    if (!eligibleForMemory) {
+      console.warn(
+        `[M1.4.9] extraction status=${candidate.extraction.status} action=${candidate.extraction.action} → memory formation blocked`,
+      );
+    }
+    const formedMem = eligibleForMemory
+      ? computeEpisodicMemoryCandidate(
+          stateAfterAppraisal,
+          userEvent,
+          userEvent.payload.moodDelta ?? 0,
+          candidate.extraction.experienceValence,
+        )
+      : null;
 
     const memoryFormationEvent: MemoryFormationEvent | null = formedMem
       ? {
@@ -469,21 +489,15 @@ async function handleChatRequest(
 
     // 7. 构建伴侣输出事件（携带候选文本与过滤结果）
     //    伴侣输出不改变自己的 mood（moodDelta=0），只消耗少量 energy
-    const companionEvent: DialogueEvent = {
-      type: 'dialogue',
+    //    M1.5.4.2：显式写入 replyToEventId = 本轮 userEvent.id（同批次真实 ID），
+    //    不依赖事件顺序、时间窗口或 LLM 推测；构建函数对空值 fail-closed。
+    const companionEvent: DialogueEvent = buildCompanionOutputEvent({
       id: generateEventId(),
       timestamp: stamp(),
-      payload: {
-        direction: 'companion_output',
-        text: filterResult.text,
-        moodDelta: 0,
-        salience: 0.3,
-        wordCount: filterResult.text.length,
-        candidateText: candidate.text,
-        filtered: filterResult.filtered,
-        filterReason: filterResult.filterReason || undefined,
-      },
-    };
+      filterResult,
+      candidateText: candidate.text,
+      replyToEventId: userEvent.id,
+    });
     const finalState = applyEvent(stateAfterChain, companionEvent);
 
     // 8. M1.4.1：五事件（或四事件）在同一事务中原子提交。

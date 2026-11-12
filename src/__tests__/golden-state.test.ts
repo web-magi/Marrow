@@ -826,7 +826,8 @@ test('[M1] MemoryFormation: 满足全部门槛 → 正确生成 EpisodicMemory',
                action: 'comfort', intensity: 0.9, moodDelta: 2.0 },
   } as any;
   // weightedMoodDelta = 2.0 * 0.65 = 1.3 >= 1.0 ✅, intensity=0.9 >= 0.5 ✅
-  const mem = computeEpisodicMemoryCandidate(s, dt, null, 2.0);
+  // M1.4.9：记忆效价由用户经历自身决定，这里显式传入 +0.6
+  const mem = computeEpisodicMemoryCandidate(s, dt, 2.0, 0.6);
   assert.ok(mem, '应生成 EpisodicMemory');
   assert.equal(mem!.id, 'epi-evt-m1-001');
   assert.equal(mem!.sourceEventId, 'evt-m1-001');
@@ -845,20 +846,20 @@ test('[M2] MemoryFormation: intensity < 0.5 → 不生成', () => {
     payload: { direction: 'user_input', text: '嗯好的',
                action: 'statement', intensity: 0.3, moodDelta: 2.0 },
   } as any;
-  const mem = computeEpisodicMemoryCandidate(s, dt, null, 2.0);
+  const mem = computeEpisodicMemoryCandidate(s, dt, 2.0);
   assert.equal(mem, null);
   console.log('  [M2 PASS] intensity=0.3 → null');
 });
 
 // ── M3: |weightedMoodDelta| 不足 → 不生成 ────────────────────────────────
-test('[M3] MemoryFormation: |weightedMoodDelta + memoryMoodDelta| < 1.0 → 不生成', () => {
+test('[M3] MemoryFormation: |weightedMoodDelta| < 1.0 → 不生成（M1.4.8 召回不参与）', () => {
   const s = createInitialState(TS);
   const dt = {
     type: 'dialogue', id: 'evt-m3-001', timestamp: TS,
     payload: { direction: 'user_input', text: '你好呀今天天气不错啊',
                action: 'greeting', intensity: 0.6, moodDelta: 0.18 },
   } as any;
-  const mem = computeEpisodicMemoryCandidate(s, dt, null, 0.18);
+  const mem = computeEpisodicMemoryCandidate(s, dt, 0.18);
   assert.equal(mem, null, '|0.117| < 1.0 → 应返回 null');
   console.log('  [M3 PASS] greeting valenceDelta=0.18 → null（与生产首次对话行为一致）');
 });
@@ -871,7 +872,7 @@ test('[M4] MemoryFormation: keywords 为空 → 不生成', () => {
     payload: { direction: 'user_input', text: '嗯啊哦嘿',
                action: 'comfort', intensity: 0.9, moodDelta: 2.0 },
   } as any;
-  const mem = computeEpisodicMemoryCandidate(s, dt, null, 2.0);
+  const mem = computeEpisodicMemoryCandidate(s, dt, 2.0);
   if (mem !== null) assert.ok(mem.keywords.length > 0);
   console.log(mem ? `  [M4 OK] text 短但仍提取 keywords: ${mem.keywords}` : '  [M4 PASS] keywords 空 → null');
 });
@@ -898,7 +899,7 @@ test('[M6] DialogueEvent + MemoryFormationEvent → 正确写入 episodicBuffer'
     payload: { direction: 'user_input', text: '你今天看起来好多了，真为你高兴！希望一切顺利。',
                action: 'comfort', intensity: 0.9, moodDelta: 2.0 },
   } as any;
-  const mem = computeEpisodicMemoryCandidate(s, dt, null, 2.0)!;
+  const mem = computeEpisodicMemoryCandidate(s, dt, 2.0)!;
   const mfe: MemoryFormationEvent = {
     type: 'memory_formation', id: 'evt-m6-002', timestamp: TS,
     payload: { sourceDialogueEventId: dt.id, memory: mem },
@@ -919,7 +920,7 @@ test('[M7] MemoryFormationEvent replay → 记忆字段与 payload 完全一致'
     payload: { direction: 'user_input', text: '你今天看起来好多了，真为你高兴！希望一切顺利。',
                action: 'comfort', intensity: 0.9, moodDelta: 2.0 },
   } as any;
-  const mem = computeEpisodicMemoryCandidate(s, dt, null, 2.0)!;
+  const mem = computeEpisodicMemoryCandidate(s, dt, 2.0)!;
   const mfe: MemoryFormationEvent = {
     type: 'memory_formation', id: 'evt-m7-002', timestamp: TS,
     payload: { sourceDialogueEventId: dt.id, memory: mem },
@@ -952,7 +953,7 @@ test('[M8] 连续两条记忆 → 不丢失、不覆盖、顺序正确', () => {
     payload: { direction: 'user_input', text: '你真好真温暖！真是太感谢了！',
                action: 'comfort', intensity: 0.9, moodDelta: 2.0 },
   } as any;
-  const mem1 = computeEpisodicMemoryCandidate(s, dt1, null, 2.0)!;
+  const mem1 = computeEpisodicMemoryCandidate(s, dt1, 2.0)!;
   const mfe1: MemoryFormationEvent = {
     type: 'memory_formation', id: 'evt-m8-002', timestamp: TS,
     payload: { sourceDialogueEventId: dt1.id, memory: mem1 },
@@ -962,7 +963,7 @@ test('[M8] 连续两条记忆 → 不丢失、不覆盖、顺序正确', () => {
     payload: { direction: 'user_input', text: '你怎么总是这么让人失望真讨厌！',
                action: 'insult', intensity: 0.9, moodDelta: -2.0 },
   } as any;
-  const mem2 = computeEpisodicMemoryCandidate(s, dt2, null, -2.0)!;
+  const mem2 = computeEpisodicMemoryCandidate(s, dt2, -2.0)!;
   const mfe2: MemoryFormationEvent = {
     type: 'memory_formation', id: 'evt-m8-004', timestamp: TS,
     payload: { sourceDialogueEventId: dt2.id, memory: mem2 },
@@ -987,7 +988,7 @@ test('[M9] MemoryFormationEvent payload 必要字段符合契约', () => {
     payload: { direction: 'user_input', text: '你真好真温暖！真是太感谢了！',
                action: 'comfort', intensity: 0.9, moodDelta: 2.0 },
   } as any;
-  const mem = computeEpisodicMemoryCandidate(s, dt, null, 2.0)!;
+  const mem = computeEpisodicMemoryCandidate(s, dt, 2.0)!;
   const mfe: MemoryFormationEvent = {
     type: 'memory_formation', id: 'evt-m9-002', timestamp: TS,
     payload: { sourceDialogueEventId: dt.id, memory: mem },
@@ -1020,7 +1021,7 @@ test('[M10] 批次事件顺序：Obs→Appr→DlgUser→MemForm→DlgComp', () =
     payload: { direction: 'user_input', text: '你真好真温暖！真是太感谢了！',
                action: 'comfort', intensity: 0.9, moodDelta: 2.0 },
   } as any;
-  const mem = computeEpisodicMemoryCandidate(s, dtUser, null, 2.0)!;
+  const mem = computeEpisodicMemoryCandidate(s, dtUser, 2.0)!;
   const memForm: MemoryFormationEvent = {
     type: 'memory_formation', id: 'evt-m10-mem', timestamp: TS,
     payload: { sourceDialogueEventId: dtUser.id, memory: mem },
